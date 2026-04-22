@@ -1,0 +1,22 @@
+# PyInstaller build artifacts
+_build_tmp/
+release/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# UI temp uploads
+_uploads/
+
+# Demo files (don't accidentally publish other people's demos)
+*.dem
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
