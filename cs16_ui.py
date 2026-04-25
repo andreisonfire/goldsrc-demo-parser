@@ -30,6 +30,12 @@ HOST = "127.0.0.1"
 PORT = 8765
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB per request
 
+# Single source of truth for the user-visible product version. Bump this
+# string when shipping a new release; it appears in the browser tab title
+# and in the page header. We deliberately do NOT compute it from git tags
+# or anywhere else — keep one literal that's grep-able.
+VERSION = "1.1"
+
 
 # ---------------------------------------------------------------------------
 # HTML (inlined so the .exe is a single self-contained file)
@@ -38,7 +44,7 @@ INDEX_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>GSDP</title>
+<title>GSDP __VERSION__</title>
 <style>
   :root {
     --bg:     #0d0f12;
@@ -102,6 +108,51 @@ INDEX_HTML = r"""<!doctype html>
     background: transparent; color: var(--ink);
     border: 1px solid var(--line);
   }
+  .export-wrap {
+    position: relative;
+    display: inline-block;
+  }
+  .export-btn::after {
+    content: ' \25BE';   /* down-arrow ▾ */
+    font-size: .7em;
+    margin-left: .3em;
+  }
+  .export-menu {
+    display: none;
+    position: absolute;
+    top: calc(100% + .35rem);
+    left: 0;
+    min-width: 220px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: .35rem 0;
+    z-index: 10;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, .35);
+  }
+  .export-menu.open { display: block; }
+  .export-row {
+    display: flex; align-items: center; gap: .75rem;
+    padding: .5rem .9rem;
+    cursor: pointer;
+    color: var(--ink);
+    font-size: .85rem;
+  }
+  .export-row:hover { background: #1b2127; }
+  .export-row .label { font-weight: 600; min-width: 38px; }
+  .export-row .fav-toggle {
+    margin-left: auto;
+    display: inline-flex; align-items: center; gap: .35rem;
+    color: var(--muted); font-size: .75rem;
+    user-select: none;
+  }
+  .export-row .fav-toggle input {
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  .export-row .fav-toggle.disabled {
+    opacity: .4; cursor: not-allowed;
+  }
   .status {
     color: var(--muted); font-size: .85rem; margin-left: auto;
   }
@@ -136,6 +187,23 @@ INDEX_HTML = r"""<!doctype html>
   }
   tr:last-child td { border-bottom: 0; }
   td.highlight { white-space: pre; color: #cdd6df; }
+  td.fav-cell {
+    text-align: center;
+    width: 1%;
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+    font-size: 1.1rem;
+    line-height: 1;
+    color: var(--muted);
+    transition: color .1s, transform .1s;
+  }
+  td.fav-cell:hover { color: var(--ink); transform: scale(1.15); }
+  td.fav-cell.active { color: #f5c518; }   /* IMDb yellow */
+  th.fav-th {
+    width: 1%;
+    text-align: center;
+  }
   td.type-HLTV { color: var(--good); }
   td.type-POV  { color: var(--warn); }
   .empty { padding: 2rem; text-align: center; color: var(--muted); }
@@ -144,11 +212,18 @@ INDEX_HTML = r"""<!doctype html>
     background: #1b2127; color: var(--accent); font-size: .7rem;
     font-weight: 600; margin-left: .5rem;
   }
+  .version-tag {
+    font-size: .75rem;
+    font-weight: 500;
+    color: var(--muted);
+    margin-left: .35rem;
+    letter-spacing: .02em;
+  }
 </style>
 </head>
 <body>
 <main>
-  <h1>GoldSrc Demo Parser <span class="badge">by THUNDERGOD</span></h1>
+  <h1>GoldSrc Demo Parser <span class="version-tag">v__VERSION__</span> <span class="badge">by THUNDERGOD</span></h1>
   <div class="sub">Drop .dem files below &mdash; output CSV matches your template.
     Everything runs on your PC. No uploads anywhere.</div>
 
@@ -160,7 +235,25 @@ INDEX_HTML = r"""<!doctype html>
 
   <div class="actions">
     <button id="clear" class="secondary" disabled>Clear</button>
-    <button id="download" disabled>Download CSV</button>
+    <span class="export-wrap">
+      <button id="export-btn" class="export-btn" disabled>Export</button>
+      <div id="export-menu" class="export-menu">
+        <div class="export-row" data-format="csv">
+          <span class="label">CSV</span>
+          <label class="fav-toggle disabled">
+            <input type="checkbox" data-format="csv" disabled>
+            favorites only
+          </label>
+        </div>
+        <div class="export-row" data-format="txt">
+          <span class="label">TXT</span>
+          <label class="fav-toggle disabled">
+            <input type="checkbox" data-format="txt" disabled>
+            favorites only
+          </label>
+        </div>
+      </div>
+    </span>
     <span class="status" id="status">Waiting for demos&hellip;</span>
   </div>
 
@@ -170,13 +263,13 @@ INDEX_HTML = r"""<!doctype html>
 </main>
 
 <script>
-const rows = [];
 const drop   = document.getElementById('drop');
 const input  = document.getElementById('file');
 const status = document.getElementById('status');
 const log    = document.getElementById('log');
 const clearBtn = document.getElementById('clear');
-const dlBtn  = document.getElementById('download');
+const exportBtn = document.getElementById('export-btn');
+const exportMenu = document.getElementById('export-menu');
 const results = document.getElementById('results');
 
 function logLine(text, cls) {
@@ -188,33 +281,98 @@ function logLine(text, cls) {
   log.scrollTop = log.scrollHeight;
 }
 
+// Each row gets a stable id assigned at insertion time so favorites
+// survive table re-renders. Row indexes alone don't work because
+// re-rendering builds new DOM nodes.
+let nextRowId = 0;
+const rowMeta = new Map();        // id -> { row: array, favorite: bool }
+const orderedIds = [];            // insertion order, drives table rendering
+
+function addRows(newRows) {
+  for (const r of newRows) {
+    const id = nextRowId++;
+    rowMeta.set(id, { row: r, favorite: false });
+    orderedIds.push(id);
+  }
+}
+
+function clearAllRows() {
+  rowMeta.clear();
+  orderedIds.length = 0;
+  // keep nextRowId increasing so old DOM listeners (if any) can't collide
+}
+
+function favoritesCount() {
+  let n = 0;
+  for (const id of orderedIds) {
+    if (rowMeta.get(id).favorite) n++;
+  }
+  return n;
+}
+
 function renderTable() {
-  if (rows.length === 0) {
+  if (orderedIds.length === 0) {
     results.innerHTML = '<div class="empty">No highlights yet.</div>';
     clearBtn.disabled = true;
-    dlBtn.disabled = true;
+    exportBtn.disabled = true;
+    exportMenu.classList.remove('open');
+    setFavoritesUiState(false);
     return;
   }
   clearBtn.disabled = false;
-  dlBtn.disabled = false;
+  exportBtn.disabled = false;
 
   const headers = ['demo_name', 'map', 'player_name', 'highlight', 'info'];
   let html = '<table><thead><tr>';
   for (const h of headers) html += `<th>${h}</th>`;
+  html += '<th class="fav-th"></th>';   // favorite column header
   html += '</tr></thead><tbody>';
 
-  for (const r of rows) {
-    html += '<tr>';
+  for (const id of orderedIds) {
+    const meta = rowMeta.get(id);
+    const r = meta.row;
+    html += `<tr data-row-id="${id}">`;
     headers.forEach((h, i) => {
       const v = r[i] === null || r[i] === undefined ? '' : String(r[i]);
       const cls = (h === 'highlight') ? 'highlight' : '';
       html += `<td class="${cls}">${escapeHtml(v)}</td>`;
     });
+    const star = meta.favorite ? '\u2605' : '\u2606';   // ★ vs ☆
+    const favCls = meta.favorite ? 'fav-cell active' : 'fav-cell';
+    html += `<td class="${favCls}" data-fav-id="${id}" title="Toggle favorite">${star}</td>`;
     html += '</tr>';
   }
   html += '</tbody></table>';
   results.innerHTML = html;
-  status.textContent = `${rows.length} highlight${rows.length === 1 ? '' : 's'} ready.`;
+
+  // Wire up star clicks
+  results.querySelectorAll('[data-fav-id]').forEach(td => {
+    td.addEventListener('click', () => {
+      const id = Number(td.dataset.favId);
+      const meta = rowMeta.get(id);
+      if (!meta) return;
+      meta.favorite = !meta.favorite;
+      td.classList.toggle('active', meta.favorite);
+      td.textContent = meta.favorite ? '\u2605' : '\u2606';
+      setFavoritesUiState(favoritesCount() > 0);
+    });
+  });
+
+  status.textContent = `${orderedIds.length} highlight${orderedIds.length === 1 ? '' : 's'} ready.`;
+  setFavoritesUiState(favoritesCount() > 0);
+}
+
+// Enable/disable the "favorites only" checkboxes in the export dropdown
+// based on whether there are any favorites at all. When disabled we also
+// uncheck them so an empty filter doesn't slip through.
+function setFavoritesUiState(hasFavorites) {
+  const checkboxes = document.querySelectorAll('.export-row .fav-toggle input');
+  const labels = document.querySelectorAll('.export-row .fav-toggle');
+  checkboxes.forEach(cb => {
+    cb.disabled = !hasFavorites;
+    if (!hasFavorites) cb.checked = false;
+  });
+  labels.forEach(l => l.classList.toggle('disabled', !hasFavorites));
 }
 
 function escapeHtml(s) {
@@ -239,15 +397,15 @@ async function handleFiles(files) {
         continue;
       }
       const added = data.rows.length;
-      rows.push(...data.rows);
+      addRows(data.rows);
       logLine(`   ok: ${added} highlight${added === 1 ? '' : 's'} `
-              + `(${data.demo_type}, ${data.map}, ${data.total_kills} total kills)`, 'ok');
+              + `(${data.demo_type}, ${data.map})`, 'ok');
     } catch (e) {
       logLine(`   ERROR: ${e.message}`, 'err');
     }
     renderTable();
   }
-  status.textContent = `${rows.length} highlight${rows.length === 1 ? '' : 's'} ready.`;
+  status.textContent = `${orderedIds.length} highlight${orderedIds.length === 1 ? '' : 's'} ready.`;
 }
 
 // Note: <label class="drop"> already wraps the file input, so clicking
@@ -267,31 +425,97 @@ drop.addEventListener('drop', e => {
   handleFiles(e.dataTransfer.files);
 });
 
-clearBtn.addEventListener('click', () => {
-  rows.length = 0;
-  log.innerHTML = '';
-  log.style.display = 'none';
-  status.textContent = 'Waiting for demos\u2026';
-  renderTable();
-});
+// === Export system ===
+// Two formats (CSV / TXT). The "favorites only" checkbox is wired up but
+// disabled until favorites are implemented in the next step.
 
-dlBtn.addEventListener('click', () => {
+function downloadBlob(blob, filename) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function rowsForExport(format) {
+  const cb = document.querySelector(
+    `.export-row[data-format="${format}"] .fav-toggle input`);
+  const favoritesOnly = cb && cb.checked && !cb.disabled;
+  const out = [];
+  for (const id of orderedIds) {
+    const meta = rowMeta.get(id);
+    if (favoritesOnly && !meta.favorite) continue;
+    out.push(meta.row);
+  }
+  return out;
+}
+
+function exportCsv() {
   const headers = ['demo_name', 'map', 'player_name', 'highlight', 'info'];
   const escape = s => {
     s = String(s ?? '');
     if (/[",\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
     return s;
   };
+  const data = rowsForExport('csv');
   const lines = [headers.join(',')];
-  for (const r of rows) lines.push(r.map(escape).join(','));
-  // UTF-8 BOM so Excel opens Cyrillic / emoji correctly
+  for (const r of data) lines.push(r.map(escape).join(','));
+  // UTF-8 BOM so Excel opens Cyrillic / emoji correctly.
   const blob = new Blob(["\ufeff" + lines.join('\r\n')],
                        { type: 'text/csv;charset=utf-8' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'cs16_highlights.csv';
-  a.click();
-  URL.revokeObjectURL(a.href);
+  downloadBlob(blob, 'gsdp_highlights.csv');
+}
+
+function exportTxt() {
+  // Format: demo_name on its own line, then each kill line of the streak,
+  // blank line between streaks. Demo name repeats before each streak so the
+  // output is easy to copy-paste in chunks.
+  const data = rowsForExport('txt');
+  const blocks = data.map(r => {
+    const demoName = r[0];
+    const highlightLines = (r[3] || '').split('\n');
+    return [demoName, ...highlightLines].join('\n');
+  });
+  const text = blocks.join('\n\n');
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  downloadBlob(blob, 'gsdp_highlights.txt');
+}
+
+// === Dropdown wiring ===
+
+exportBtn.addEventListener('click', e => {
+  e.stopPropagation();
+  exportMenu.classList.toggle('open');
+});
+
+// Close dropdown when clicking outside
+document.addEventListener('click', e => {
+  if (!exportMenu.contains(e.target) && e.target !== exportBtn) {
+    exportMenu.classList.remove('open');
+  }
+});
+
+// Click on a row exports that format
+exportMenu.querySelectorAll('.export-row').forEach(row => {
+  row.addEventListener('click', e => {
+    // Don't trigger export when clicking on the checkbox itself
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'LABEL'
+        || e.target.closest('label')) {
+      return;
+    }
+    const format = row.dataset.format;
+    if (format === 'csv') exportCsv();
+    else if (format === 'txt') exportTxt();
+    exportMenu.classList.remove('open');
+  });
+});
+
+clearBtn.addEventListener('click', () => {
+  clearAllRows();
+  log.innerHTML = '';
+  log.style.display = 'none';
+  status.textContent = 'Waiting for demos\u2026';
+  renderTable();
 });
 
 renderTable();
@@ -361,7 +585,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
-            body = INDEX_HTML.encode("utf-8")
+            # Substitute the version placeholders before serving. Using
+            # replace() rather than f-string interpolation so we don't
+            # need to escape every JS ${...} template literal in the HTML.
+            html = INDEX_HTML.replace("__VERSION__", VERSION)
+            body = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -400,12 +628,10 @@ class Handler(BaseHTTPRequestHandler):
                 # replace the tmp filename with the one the user uploaded
                 parsed["demo_name"] = filename
                 rows = build_csv_rows(parsed)
-                total_kills = sum(len(s) for s in parsed["highlights"])
                 resp = {
                     "rows": rows,
                     "map": parsed["map_name"],
                     "demo_type": parsed["demo_type"],
-                    "total_kills": total_kills,
                     "highlight_count": len(parsed["highlights"]),
                 }
                 return self._send_json(resp)

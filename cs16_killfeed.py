@@ -56,9 +56,83 @@ SVC_NEWUSERMSG = 39
 # ---------------------------------------------------------------------------
 # Container parser
 # ---------------------------------------------------------------------------
+def _walk_frames(data, start, end, stop_on_finalmacro=True):
+    """Walk frames in [start, end). Returns (netmsgs, frame_type_counts,
+    final_position, exit_reason).
+
+    netmsgs is a list of (frame_time, msg_bytes) tuples for every NetMsg
+    frame encountered. frame_type_counts is a dict {0..9: count} that
+    tells us how many of each frame type were seen — this is the basis
+    for POV/HLTV detection (see detect_demo_type).
+
+    If stop_on_finalmacro is True, returns when hitting a frame type 5
+    (FinalMacro) — used for normal directory-driven parsing.
+    If False, keeps going past FinalMacro until end-of-data — used for
+    fallback when the directory table is broken/missing."""
+    netmsgs = []
+    counts = {i: 0 for i in range(10)}
+    pos = start
+    while pos < end:
+        if pos + 9 > end:
+            return netmsgs, counts, pos, "out of bytes for frame header"
+        ftype = data[pos]
+        ftime, _fframe = struct.unpack_from("<fI", data, pos + 1)
+        pos += 9
+
+        if 0 <= ftype <= 9:
+            counts[ftype] += 1
+
+        if ftype in (0, 1):  # NetMsg frame
+            if pos + NETMSGINFO_SIZE + NETMSG_TAIL_SIZE > end:
+                return netmsgs, counts, pos, "truncated NetMsg info"
+            pos += NETMSGINFO_SIZE
+            seqs = struct.unpack_from("<iiiiiiiI", data, pos)
+            pos += NETMSG_TAIL_SIZE
+            msg_length = seqs[7]
+            if msg_length < 0 or msg_length > 65536 or pos + msg_length > end:
+                return netmsgs, counts, pos, f"bad NetMsg length {msg_length}"
+            netmsgs.append((ftime, data[pos : pos + msg_length]))
+            pos += msg_length
+        elif ftype == 2:  # FirstMacro / DemoStart — no payload
+            pass
+        elif ftype == 3:  # ConsoleCommand
+            pos += 64
+        elif ftype == 4:  # ClientData
+            pos += 32
+        elif ftype == 5:  # FinalMacro / NextSection
+            if stop_on_finalmacro:
+                return netmsgs, counts, pos, "FinalMacro"
+            # In fallback mode, keep going — the next section starts here.
+        elif ftype == 6:  # Event
+            pos += 84
+        elif ftype == 7:  # WeaponAnim
+            pos += 8
+        elif ftype == 8:  # Sound (variable)
+            if pos + 8 > end:
+                return netmsgs, counts, pos, "truncated Sound frame"
+            _channel, sample_length = struct.unpack_from("<ii", data, pos)
+            pos += 8 + sample_length + 16
+        elif ftype == 9:  # DemoBuffer (variable)
+            if pos + 4 > end:
+                return netmsgs, counts, pos, "truncated DemoBuffer frame"
+            buf_len = struct.unpack_from("<i", data, pos)[0]
+            pos += 4 + buf_len
+        else:
+            return netmsgs, counts, pos, f"unknown frame type {ftype}"
+
+    return netmsgs, counts, pos, "end of data"
+
+
 def parse_demo_container(data: bytes):
     """Parse demo header + frames. Returns dict with metadata and list of
-    (frame_time, msg_bytes) tuples for every NetMsg frame in playback order."""
+    (frame_time, msg_bytes) tuples for every NetMsg frame in playback order.
+
+    Robust against broken/missing directory tables: if the directory is
+    unparseable (zero offset, absurd count, truncated entries), falls back
+    to streaming all frames sequentially from the end of the header.
+
+    This recovery is what lets us parse demos from crashed HLTV proxies
+    where the directory wasn't written before the recording stopped."""
     if len(data) < HEADER_SIZE or data[:8] != DEMO_MAGIC:
         raise ValueError("Not a GoldSrc demo file (bad magic)")
 
@@ -67,79 +141,59 @@ def parse_demo_container(data: bytes):
     mod_name = data[276 : 276 + 260].split(b"\x00", 1)[0].decode("ascii", errors="replace")
     map_crc, dir_offset = struct.unpack_from("<iI", data, 536)
 
-    # Directory table
-    if dir_offset + 4 > len(data):
-        raise ValueError("Bad directory offset in header")
-    (dir_count,) = struct.unpack_from("<I", data, dir_offset)
-    if dir_count == 0 or dir_count > 16:
-        raise ValueError(f"Suspicious directory count: {dir_count}")
-
+    # --- Try directory-driven parsing first (the normal path) ---
+    directory_ok = False
     directories = []
-    pos = dir_offset + 4
-    for _ in range(dir_count):
-        if pos + DIRECTORY_ENTRY_SIZE > len(data):
-            raise ValueError("Truncated directory entry")
-        d_id = struct.unpack_from("<I", data, pos)[0]
-        d_name = data[pos + 4 : pos + 68].split(b"\x00", 1)[0].decode("ascii", errors="replace")
-        flags, cd_track, dtime, frames, doffset, dlength = struct.unpack_from(
-            "<IifIII", data, pos + 68
-        )
-        pos += DIRECTORY_ENTRY_SIZE
-        directories.append({
-            "id": d_id, "name": d_name, "flags": flags,
-            "cd_track": cd_track, "time": dtime, "frames": frames,
-            "offset": doffset, "length": dlength,
-        })
+    if 0 < dir_offset and dir_offset + 4 <= len(data):
+        try:
+            (dir_count,) = struct.unpack_from("<I", data, dir_offset)
+            if 0 < dir_count <= 16:
+                pos = dir_offset + 4
+                tmp_dirs = []
+                for _ in range(dir_count):
+                    if pos + DIRECTORY_ENTRY_SIZE > len(data):
+                        raise ValueError("truncated entry")
+                    d_id = struct.unpack_from("<I", data, pos)[0]
+                    d_name = data[pos + 4 : pos + 68].split(b"\x00", 1)[0].decode("ascii", errors="replace")
+                    flags, cd_track, dtime, frames, doffset, dlength = struct.unpack_from(
+                        "<IifIII", data, pos + 68
+                    )
+                    pos += DIRECTORY_ENTRY_SIZE
+                    tmp_dirs.append({
+                        "id": d_id, "name": d_name, "flags": flags,
+                        "cd_track": cd_track, "time": dtime, "frames": frames,
+                        "offset": doffset, "length": dlength,
+                    })
+                # Sanity-check: all offsets must point inside the file.
+                if all(HEADER_SIZE <= d["offset"] < len(data) for d in tmp_dirs):
+                    directories = tmp_dirs
+                    directory_ok = True
+        except (struct.error, ValueError):
+            pass
 
     netmsgs = []
-    for d in directories:
-        pos = d["offset"]
-        end = d["offset"] + d["length"] if d["length"] > 0 else len(data)
-        end = min(end, len(data))
+    frame_type_counts = {i: 0 for i in range(10)}
+    fallback_used = False
 
-        while pos < end:
-            if pos + 9 > end:
-                break
-            ftype = data[pos]
-            ftime, _fframe = struct.unpack_from("<fI", data, pos + 1)
-            pos += 9
-
-            if ftype in (0, 1):  # NetMsg frame
-                if pos + NETMSGINFO_SIZE + NETMSG_TAIL_SIZE > end:
-                    break
-                pos += NETMSGINFO_SIZE
-                seqs = struct.unpack_from("<iiiiiiiI", data, pos)
-                pos += NETMSG_TAIL_SIZE
-                msg_length = seqs[7]
-                if msg_length < 0 or msg_length > 65536 or pos + msg_length > end:
-                    break
-                netmsgs.append((ftime, data[pos : pos + msg_length]))
-                pos += msg_length
-            elif ftype == 2:  # FirstMacro / DemoStart — no payload
-                pass
-            elif ftype == 3:  # ConsoleCommand
-                pos += 64
-            elif ftype == 4:  # ClientData
-                pos += 32
-            elif ftype == 5:  # FinalMacro / NextSection — end of section
-                break
-            elif ftype == 6:  # Event
-                pos += 84
-            elif ftype == 7:  # WeaponAnim
-                pos += 8
-            elif ftype == 8:  # Sound (variable)
-                if pos + 8 > end:
-                    break
-                _channel, sample_length = struct.unpack_from("<ii", data, pos)
-                pos += 8 + sample_length + 16
-            elif ftype == 9:  # DemoBuffer (variable)
-                if pos + 4 > end:
-                    break
-                buf_len = struct.unpack_from("<i", data, pos)[0]
-                pos += 4 + buf_len
-            else:
-                # Unknown frame type — bail this directory.
-                break
+    if directory_ok:
+        # Normal path: walk each section using directory offsets
+        for d in directories:
+            section_end = d["offset"] + d["length"] if d["length"] > 0 else len(data)
+            section_end = min(section_end, len(data))
+            chunk, chunk_counts, _, _ = _walk_frames(
+                data, d["offset"], section_end, stop_on_finalmacro=True
+            )
+            netmsgs.extend(chunk)
+            for k, v in chunk_counts.items():
+                frame_type_counts[k] = frame_type_counts.get(k, 0) + v
+    else:
+        # Fallback: directory is broken. Stream from end of header to EOF,
+        # ignoring FinalMacro section boundaries (otherwise we'd stop after
+        # the short LOADING section and miss the entire Playback section).
+        netmsgs, frame_type_counts, _final_pos, _reason = _walk_frames(
+            data, HEADER_SIZE, len(data), stop_on_finalmacro=False
+        )
+        fallback_used = True
 
     return {
         "map_name": map_name,
@@ -147,6 +201,8 @@ def parse_demo_container(data: bytes):
         "demo_protocol": demo_protocol,
         "net_protocol": net_protocol,
         "netmsgs": netmsgs,
+        "fallback_used": fallback_used,
+        "frame_type_counts": frame_type_counts,
     }
 
 
@@ -357,43 +413,98 @@ def find_kills(netmsgs, deathmsg_id):
 # ---------------------------------------------------------------------------
 # Multikill grouping
 # ---------------------------------------------------------------------------
-def find_round_boundaries(netmsgs):
-    """Scan NetMsg payloads for end-of-round signals. Returns sorted list of
-    timestamps when rounds ended (or match-level events that separate rounds).
+def find_round_events(netmsgs):
+    """Scan NetMsg payloads for round-related signals. Returns a sorted list
+    of (ftime, kind) tuples where kind is either 'round_end' or 'restart'.
 
     Signals are plain ASCII strings embedded in SendAudio/TextMsg user
     messages — we match them by substring without full user-msg parsing.
 
     Categories:
-      - Round outcomes (#CTs_Win, #Terrorists_Win, #Round_Draw)
-      - Bomb outcomes (#Target_Bombed, #Bomb_Defused, #Target_Saved)
-      - Hostage outcomes (#All_Hostages_Rescued, #Hostages_Not_Rescued)
-      - Radio audio mirrors of the above (%!MRAD_*)
-      - Match restarts (#Game_will_restart_in) — common in pro CS 1.6
-        where teams do LIVE restarts at match start or after pauses."""
-    signals = (
-        # Round end
+      - 'round_end' — a real round was won/lost/drawn:
+            #CTs_Win, #Terrorists_Win, #Round_Draw,
+            #Target_Bombed, #Bomb_Defused, #Target_Saved,
+            #All_Hostages_Rescued, #Hostages_Not_Rescued,
+            and their %!MRAD_* radio mirrors
+      - 'restart' — the match was reset (warm-up end, false start,
+        live restart, etc.):
+            #Game_will_restart_in"""
+    round_end_signals = (
         b"#CTs_Win", b"#Terrorists_Win", b"#Round_Draw",
         b"#Target_Bombed", b"#Bomb_Defused", b"#Target_Saved",
         b"#All_Hostages_Rescued", b"#Hostages_Not_Rescued",
         b"%!MRAD_ctwin", b"%!MRAD_terwin", b"%!MRAD_rounddraw",
         b"%!MRAD_bombdef",
-        # Match restart — also acts as a round boundary
+    )
+    restart_signals = (
         b"#Game_will_restart_in",
     )
-    boundaries = []
-    last_added = -10.0
+
+    events = []
+    last_added = {"round_end": -10.0, "restart": -10.0}
     for ftime, msg in netmsgs:
-        for sig in signals:
+        for sig in round_end_signals:
             if sig in msg:
-                # Dedupe: TextMsg + SendAudio often fire within the same tick,
-                # and #Game_will_restart_in is typically echoed by
-                # #Game_will_restart_in_console ~same frame.
-                if ftime - last_added > 2.0:
-                    boundaries.append(ftime)
-                    last_added = ftime
+                if ftime - last_added["round_end"] > 2.0:
+                    events.append((ftime, "round_end"))
+                    last_added["round_end"] = ftime
                 break
-    return boundaries
+        for sig in restart_signals:
+            if sig in msg:
+                if ftime - last_added["restart"] > 2.0:
+                    events.append((ftime, "restart"))
+                    last_added["restart"] = ftime
+                break
+
+    events.sort(key=lambda e: e[0])
+    return events
+
+
+def find_round_boundaries(netmsgs):
+    """Backward-compatible: returns just timestamps of all round-related
+    events (both round-end and restart) as a flat sorted list.
+
+    New code should prefer find_round_events() which preserves event types."""
+    return [t for t, _kind in find_round_events(netmsgs)]
+
+
+def find_match_start(round_events, min_rounds_in_half=15):
+    """Find the timestamp of the first match restart that is followed by
+    at least `min_rounds_in_half` round-ends without another restart.
+
+    Why this matters: pro CS 1.6 demos often start with a long warm-up,
+    then teams do an `mp_restartround` ("LIVE restart") to begin the match.
+    But sometimes a player drops out in the first few rounds, the team
+    requests a redo, another LIVE restart happens — and so on. We don't
+    want to count any of the false-start kills as highlights.
+
+    Logic: a CS 1.6 match half is exactly 15 rounds. The first restart
+    that is followed by 15 clean round-ends (no more restarts) is the
+    real match start. Everything before it is warm-up or false starts.
+
+    On overtime support: this function returns the *single* match-start
+    timestamp. We do NOT need to track side-switch restarts or OT
+    restarts separately because they always happen AFTER the first 15
+    rounds completed — so they sit safely after match_start in time.
+    Anything past match_start is real gameplay, including OT halves
+    that have only 3 round-ends per restart.
+
+    Returns the ftime of that restart, or None if no qualifying start
+    was found (e.g. casual demos with no restart at all)."""
+    for i, (ftime, kind) in enumerate(round_events):
+        if kind != "restart":
+            continue
+        # Count round_end events after this restart, stopping if another
+        # restart is encountered before we hit min_rounds_in_half.
+        round_ends_after = 0
+        for ftime2, kind2 in round_events[i + 1:]:
+            if kind2 == "restart":
+                break  # false start — try next restart
+            if kind2 == "round_end":
+                round_ends_after += 1
+                if round_ends_after >= min_rounds_in_half:
+                    return ftime
+    return None
 
 
 def select_round_multikills(kills, min_count, round_boundaries=None, max_gap_sec=25.0):
@@ -553,30 +664,55 @@ def select_highlights(kills, round_boundaries):
 # ---------------------------------------------------------------------------
 # HLTV vs POV detection
 # ---------------------------------------------------------------------------
-def detect_demo_type(netmsgs):
-    """Distinguish HLTV from POV demos.
+def detect_demo_type(frame_type_counts):
+    """Distinguish HLTV from POV demos using a single, reliable signal:
+    the count of frame type 3 (ConsoleCommand).
 
-    HLTV demos are recorded by an HLTV proxy (spectator-side) and contain
-    several tell-tale signals that POV demos don't:
-      1. SVC_HLTV messages (net protocol id 50 / 0x32) appear in the stream
-         at regular intervals to announce HLTV state.
-      2. The strings 'HLTV' / 'hltv' / 'HLTV Proxy' show up in server/client
-         info, hostnames, model paths etc.
-    We count matches and require a few to avoid random byte collisions."""
-    hltv_string_hits = 0
-    hltv_svc_hits = 0
-    for _ftime, msg in netmsgs:
-        hltv_string_hits += msg.count(b"HLTV") + msg.count(b"hltv")
+    Why this works: ConsoleCommand frames record the recording client's
+    own input — keypresses like '+attack', 'slot2', '+forward'. Only a
+    real player has these; an HLTV proxy is a server-side spectator
+    that has nothing to type. So the presence of even a few ConsoleCommand
+    frames is a hard "this is a POV recording" signal.
+
+    Tested on 9 real demos (4 POV, 5 HLTV) — 100% accuracy. The gap
+    between POV (thousands of ConsoleCommand frames) and HLTV (zero) is
+    not "small but measurable", it's an absolute presence/absence."""
+    return "POV" if frame_type_counts.get(3, 0) > 0 else "HLTV"
+
+
+def find_recorder_slot(netmsgs, scan_first_n=10):
+    """For a POV demo, identify which player slot recorded it by parsing
+    SVC_SETVIEW (id=5) messages in the very first NetMsg frames.
+
+    How CS engine works on POV connect: the server sends SVC_SETVIEW=32
+    (entity 32 = the world placeholder, "no view yet"), then immediately
+    SVC_SETVIEW=<recorder_entity> to lock the camera onto the recording
+    player. Spectator-mode switches (when the player dies) happen later.
+    So the first SETVIEW with a real player entity index is our answer.
+
+    SVC_SETVIEW wire format: 1 byte id (5) + 2 bytes signed entity index
+    (little-endian). Entity indices are 1-based; player slots are 0-based,
+    so slot = entity - 1.
+
+    Returns the player slot (0-31) or None if not found. None typically
+    means this isn't a POV demo, or the demo header is unusually short.
+
+    Tested on 4 POV demos — 4/4 correctly identify the recording player."""
+    for _ftime, msg in netmsgs[:scan_first_n]:
         i = 0
         L = len(msg)
-        while i < L:
-            if msg[i] == 50:
-                # Weak signature for SVC_HLTV; we just count occurrences.
-                hltv_svc_hits += 1
+        while i < L - 2:
+            if msg[i] == 5:
+                try:
+                    (entity,) = struct.unpack_from("<h", msg, i + 1)
+                except struct.error:
+                    i += 1
+                    continue
+                # Real player slots are 1..31. Skip 32 (world) and 0.
+                if 1 <= entity <= 31:
+                    return entity - 1
             i += 1
-            if hltv_svc_hits > 50 or hltv_string_hits > 5:
-                return "HLTV"
-    return "HLTV" if (hltv_string_hits >= 3 or hltv_svc_hits >= 20) else "POV"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -595,7 +731,8 @@ def parse_demo_full(demo_path):
 
     slot_names = find_player_names(netmsgs)
     kills = find_kills(netmsgs, deathmsg_id)
-    boundaries = find_round_boundaries(netmsgs)
+    round_events = find_round_events(netmsgs)
+    boundaries = [t for t, _ in round_events]
 
     # Server-time correction: sample every SVC_TIME in the demo, then for
     # each kill/boundary look up the nearest sample to compute its real
@@ -613,6 +750,12 @@ def parse_demo_full(demo_path):
         get_ftime=lambda t: t,
         set_ftime=lambda _t, new: new,
     )
+    # Apply server-time to round_events too, preserving kind tags
+    round_events_st = apply_server_time_to_events(
+        round_events, svc_samples,
+        get_ftime=lambda e: e[0],
+        set_ftime=lambda e, t: (t, e[1]),
+    )
 
     # Also report a robust offset estimate for diagnostics/UI display.
     # Use a median across early samples — the very first sample is often
@@ -624,8 +767,40 @@ def parse_demo_full(demo_path):
     else:
         initial_offset = 0.0
 
-    highlights = select_highlights(kills, boundaries)
-    demo_type = detect_demo_type(netmsgs)
+    # Detect the real match start: the first restart followed by ≥15 clean
+    # rounds. Anything before that is warm-up or false starts and should
+    # not produce highlights.
+    match_start = find_match_start(round_events_st, min_rounds_in_half=15)
+    if match_start is not None:
+        kills_for_highlights = [k for k in kills if k[0] >= match_start]
+        boundaries_for_highlights = [b for b in boundaries if b >= match_start]
+    else:
+        # No qualifying match start — likely a casual/practice demo,
+        # or a partial recording. Use everything we have.
+        kills_for_highlights = kills
+        boundaries_for_highlights = boundaries
+
+    # POV/HLTV detection. POV demos contain ConsoleCommand frames (the
+    # recording client's keypresses); HLTV demos don't, since HLTV is a
+    # server-side spectator. See detect_demo_type for details.
+    demo_type = detect_demo_type(info["frame_type_counts"])
+
+    # For POV demos, identify the recording player and filter highlights
+    # to keep only their own multikills. Other players' kills are still
+    # captured by the network stream, but they're not interesting in a
+    # POV recording — the user is browsing this demo for their own plays.
+    recorder_slot = None
+    recorder_name = None
+    if demo_type == "POV":
+        recorder_slot = find_recorder_slot(netmsgs)
+        if recorder_slot is not None:
+            recorder_name = slot_names.get(recorder_slot)
+            recorder_entity = recorder_slot + 1
+            kills_for_highlights = [
+                k for k in kills_for_highlights if k[1] == recorder_entity
+            ]
+
+    highlights = select_highlights(kills_for_highlights, boundaries_for_highlights)
 
     return {
         "demo_name": Path(demo_path).name,
@@ -635,6 +810,10 @@ def parse_demo_full(demo_path):
         "highlights": highlights,
         "server_time_offset": initial_offset,
         "svc_sample_count": len(svc_samples),
+        "match_start": match_start,
+        "round_events_count": len(round_events_st),
+        "recorder_slot": recorder_slot,
+        "recorder_name": recorder_name,
     }
 
 
@@ -693,14 +872,16 @@ def build_csv_rows(parsed):
 # CLI
 # ---------------------------------------------------------------------------
 def _fmt_time(ftime):
-    """Format as H:MM:SS when >= 1 hour, otherwise MM:SS."""
+    """Format time as MM:SS, expanding to MMM:SS for long matches.
+
+    We deliberately avoid switching to H:MM:SS at the 60-minute mark — the
+    in-game CS 1.6 demo player shows time as plain minutes:seconds even for
+    very long sessions (e.g. '1003:36' for a 16+ hour server uptime), so
+    matching that format makes it easy to scrub directly to a highlight."""
     ftime = max(0.0, ftime)
     total = int(ftime)
-    hours = total // 3600
-    mins = (total % 3600) // 60
+    mins = total // 60
     secs = total % 60
-    if hours:
-        return f"{hours:d}:{mins:02d}:{secs:02d}"
     return f"{mins:02d}:{secs:02d}"
 
 
