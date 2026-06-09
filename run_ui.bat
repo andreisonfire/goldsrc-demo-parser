@@ -1,24 +1,18 @@
 @echo off
 REM ============================================================
-REM  Launch the CS 1.6 demo highlights web UI
-REM  Opens http://localhost:8765 in your default browser
+REM  CS 1.6 demo highlights — Web UI launcher
+REM  Opens a browser at http://localhost:8765 where you can
+REM  drag .dem files in and export highlights as CSV or TXT.
 REM ============================================================
 setlocal
 
-REM --- prefer the .exe if it's already built ---
-set "EXE=%~dp0cs16_ui.exe"
-if exist "%EXE%" (
-    "%EXE%"
-    goto :end
-)
-
-REM --- otherwise run the Python script directly ---
 where python >nul 2>nul
 if errorlevel 1 (
     where py >nul 2>nul
     if errorlevel 1 (
-        echo [ERROR] Python not found and cs16_ui.exe is missing.
-        echo Either build the .exe via build_exe.bat, or install Python.
+        echo [ERROR] Python not found in PATH.
+        echo Install Python 3 from https://www.python.org/downloads/
+        echo Make sure to check "Add Python to PATH" during install.
         pause
         exit /b 1
     )
@@ -27,13 +21,19 @@ if errorlevel 1 (
     set "PY=python"
 )
 
-if not exist "%~dp0cs16_ui.py" (
+set "SCRIPT=%~dp0cs16_ui.py"
+if not exist "%SCRIPT%" (
     echo [ERROR] cs16_ui.py not found next to this .bat
     pause
     exit /b 1
 )
 
-"%PY%" "%~dp0cs16_ui.py"
-
-:end
+echo Starting GoldSrc Demo Parser UI...
+echo The browser should open automatically. If not, visit:
+echo   http://localhost:8765
+echo.
+echo Press Ctrl+C in this window to stop the server.
+echo.
+"%PY%" "%SCRIPT%"
+pause
 endlocal

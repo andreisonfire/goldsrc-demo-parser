@@ -363,6 +363,197 @@ def find_player_names(netmsgs):
     return slot_names
 
 
+def find_name_history(netmsgs):
+    """Build slot -> list of (ftime, name) tuples — full name history per slot.
+
+    Returns timestamps in DEMO time (raw netmsg ftime), not server time. The
+    caller maps to server time as needed.
+
+    Why this exists: a player can change nick mid-game or after the match
+    ends. The simple `slot_names` dict only stores the LAST name seen, which
+    means kills made earlier in the match get attributed to the player's
+    post-match name. Common example: an esports player finishes their game
+    and renames to 'gg' / 'kk' / 'bb'. Without the history, all their kills
+    show up as 'gg' in the CSV.
+
+    Use `name_at_time(history, slot, demo_time)` to look up the right name.
+    """
+    return _scan_userinfo_field(netmsgs, b"name")
+
+
+def find_model_history(netmsgs):
+    """Build slot -> list of (ftime, model_name) tuples — model per slot over time.
+
+    The 'model' field in CS 1.6 userinfo carries the player's character model,
+    which directly maps to the team they're playing for:
+      CT models: urban, sas, gign, gsg9, spetsnaz
+      T models:  terror, leet, guerilla, arctic, militia
+
+    The model updates at side switches (typically after 15 rounds), so
+    tracking it over time lets us answer "what side was this player on at
+    the moment of this kill?" — needed to identify team-kills and exclude
+    them from highlight counts.
+
+    Why model and not the \\team\\ field: many CS 1.6 demos don't include
+    the team key in their userinfo blob, but the model is reliably set on
+    every spawn. The model:side mapping is fixed by the game.
+    """
+    return _scan_userinfo_field(netmsgs, b"model")
+
+
+def _scan_userinfo_field(netmsgs, field_name):
+    """Generic scanner: extract a specific \\fieldname\\value\\ from every
+    SVC_UPDATEUSERINFO seen in the demo, deduplicating consecutive equal
+    values per slot. Returns slot -> [(ftime, value), ...]."""
+    pattern = re.compile(rb"\\" + re.escape(field_name) + rb"\\([^\\\x00]+)")
+    history = {}
+    for ftime, msg in netmsgs:
+        i = 0
+        L = len(msg)
+        while i < L - 7:
+            if msg[i] == SVC_UPDATEUSERINFO and msg[i + 1] <= 31:
+                first = msg[i + 6]
+                if first == 0x5C or first == 0:
+                    slot = msg[i + 1]
+                    null_pos = msg.find(b"\x00", i + 6, min(i + 6 + 260, L))
+                    if null_pos >= i + 6:
+                        userinfo = msg[i + 6 : null_pos]
+                        m = pattern.search(userinfo)
+                        if m:
+                            value_bytes = m.group(1)
+                            value = None
+                            for enc in ("utf-8", "cp1251", "latin-1"):
+                                try:
+                                    value = value_bytes.decode(enc)
+                                    break
+                                except UnicodeDecodeError:
+                                    continue
+                            if value is None:
+                                value = value_bytes.decode("ascii", errors="replace")
+                            lst = history.setdefault(slot, [])
+                            # Dedupe consecutive identical values
+                            if not lst or lst[-1][1] != value:
+                                lst.append((ftime, value))
+                        i = null_pos + 1 + 16
+                        continue
+            i += 1
+    return history
+
+
+# CS 1.6 model -> side mapping (fixed by the game)
+CT_MODELS = {"urban", "sas", "gign", "gsg9", "spetsnaz"}
+T_MODELS  = {"terror", "leet", "guerilla", "arctic", "militia"}
+
+
+def model_to_side(model_name):
+    """Return 'CT', 'T', or None for a CS 1.6 character model name.
+
+    None means "unknown" — could be a spectator-only entity, a custom server
+    model, or a partial parse. Callers should treat None as "don't assume
+    same team" so we don't accidentally drop legitimate kills.
+    """
+    if not model_name:
+        return None
+    m = model_name.lower()
+    if m in CT_MODELS:
+        return "CT"
+    if m in T_MODELS:
+        return "T"
+    return None
+
+
+def side_at_time(model_history, slot, query_time):
+    """Return CT/T for a slot at a specific moment, or None if unknown.
+
+    Looks up the most recent model update for this slot at or before
+    query_time, then maps to side. Same time-base contract as
+    name_at_time — caller must use either demo time or server time
+    consistently for both arguments and the history.
+    """
+    entries = model_history.get(slot)
+    if not entries:
+        return None
+    last_model = entries[0][1]
+    for t, model in entries:
+        if t > query_time:
+            break
+        last_model = model
+    return model_to_side(last_model)
+
+
+def is_teammate_kill(kill, model_history):
+    """True iff this kill is a team-kill (killer and victim on the same side
+    at the moment of the kill).
+
+    Conservative: only returns True when BOTH sides are known and equal.
+    If either is unknown, returns False so we don't drop legitimate kills
+    when team info is missing (some demos may have partial userinfo data).
+    """
+    ftime, killer_ent, victim_ent, _hs, _w = kill
+    if killer_ent == 0 or killer_ent == victim_ent:
+        return False
+    # Entity index in kill tuples is 1-based; userinfo slot is 0-based
+    k_side = side_at_time(model_history, killer_ent - 1, ftime)
+    v_side = side_at_time(model_history, victim_ent - 1, ftime)
+    if k_side is None or v_side is None:
+        return False
+    return k_side == v_side
+
+
+def name_at_time(history, slot, query_time, fallback=None):
+    """Look up the player's name at a specific moment in time.
+
+    Returns the most recent name set BEFORE or AT query_time. If the slot
+    has no history entries before this time (e.g. query is from before any
+    userinfo packet for this slot), returns the FIRST known name as a
+    fallback — better than returning None which would corrupt downstream
+    formatting.
+
+    history: dict from find_name_history()
+    slot: 0-based slot index
+    query_time: float — same time-base as history entries (demo or server time,
+                pick one consistently in the caller)
+    fallback: returned if slot has no history at all
+    """
+    entries = history.get(slot)
+    if not entries:
+        return fallback
+    last = entries[0][1]    # first known name as default
+    for t, name in entries:
+        if t > query_time:
+            break
+        last = name
+    return last
+
+
+def most_common_name(history, slot, fallback=None):
+    """Return the name this slot held the LONGEST during the demo.
+
+    Used for the recorder identification: a player who renames mid-game or
+    after the match still has a 'canonical' name (the one they used for most
+    of the demo). Picking that instead of the last name avoids
+    'recorder=gg' artifacts in the UI for esports demos.
+    """
+    entries = history.get(slot)
+    if not entries:
+        return fallback
+    if len(entries) == 1:
+        return entries[0][1]
+    # Compute duration each name was held. The last entry runs until the end
+    # of the demo, which we estimate as max(all_times) + small epsilon.
+    all_times = []
+    for h in history.values():
+        for t, _n in h:
+            all_times.append(t)
+    end_time = max(all_times) if all_times else entries[-1][0] + 1
+    durations = {}
+    for i, (t, name) in enumerate(entries):
+        next_t = entries[i + 1][0] if i + 1 < len(entries) else end_time
+        durations[name] = durations.get(name, 0) + (next_t - t)
+    # Return the name with the largest total duration
+    return max(durations.items(), key=lambda x: x[1])[0]
+
+
 def find_kills(netmsgs, deathmsg_id):
     """Scan all NetMsg payloads for variable-length user message <deathmsg_id>.
     Wire (variable-size user msg): byte id, byte length, then <length> bytes.
@@ -598,23 +789,179 @@ def select_multikills(kills, window_sec, min_count):
 # ---------------------------------------------------------------------------
 # Highlight selection for CSV export
 # ---------------------------------------------------------------------------
+ONE_SHOT_WEAPONS = {"awp", "scout"}
+ONE_SHOT_WINDOW = 1.0   # seconds: kills closer than this count as a single one-shot multikill
 HS_COMBO_WEAPONS = {"deagle", "ak47", "m4a1"}
+HS_COMBO_WINDOW = 5.0   # seconds: 3 HS within this window with combo weapons is "fast 3hs"
+
+
+def _find_one_shot_subset(klst, weapon_name, k, window):
+    """Find a subset of `k` kills with `weapon_name`, within `window` seconds
+    of each other. Returns the matching sublist (sorted) or None."""
+    candidates = [x for x in klst if x[4].lower() == weapon_name]
+    if len(candidates) < k:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    # Sliding window of size k
+    for i in range(len(candidates) - k + 1):
+        window_kills = candidates[i:i + k]
+        if window_kills[-1][0] - window_kills[0][0] <= window:
+            return window_kills
+    return None
+
+
+def _find_fast_3hs_subset(klst):
+    """Find 3 HS kills with HS-combo weapons (deagle/ak47/m4a1) within 5s."""
+    hs_combo = [x for x in klst if x[3] == 1 and x[4].lower() in HS_COMBO_WEAPONS]
+    if len(hs_combo) < 3:
+        return None
+    hs_combo.sort(key=lambda x: x[0])
+    for i in range(len(hs_combo) - 2):
+        window_kills = hs_combo[i:i + 3]
+        if window_kills[-1][0] - window_kills[0][0] <= HS_COMBO_WINDOW:
+            return window_kills
+    return None
+
+
+def _find_all_one_shot_doubles(klst, used_ids):
+    """Find ALL non-overlapping 2-kill subsets of awp/scout within 1s.
+
+    `used_ids` is the set of id()s of kills already consumed by other subsets
+    (e.g. by a triple). Those kills are excluded from this search so we don't
+    double-count.
+
+    Greedy algorithm: walk through kills in time order, pair up the first
+    two that are within 1s, mark them used, continue. This finds the maximum
+    number of non-overlapping doubles when there are no overlapping pairs.
+
+    Returns list of (subset, weapon_name) tuples, one per double found.
+    """
+    doubles = []
+    for w in ONE_SHOT_WEAPONS:
+        weapon_kills = [k for k in klst
+                        if k[4].lower() == w and id(k) not in used_ids]
+        weapon_kills.sort(key=lambda k: k[0])
+        i = 0
+        while i < len(weapon_kills) - 1:
+            if weapon_kills[i + 1][0] - weapon_kills[i][0] <= ONE_SHOT_WINDOW:
+                pair = weapon_kills[i:i + 2]
+                doubles.append((pair, w))
+                used_ids.add(id(pair[0]))
+                used_ids.add(id(pair[1]))
+                i += 2
+            else:
+                i += 1
+    return doubles
+
+
+def _scan_subsets(klst):
+    """Inside a bucket of kills (one player, one round), find notable subsets.
+
+    Returns a dict with possible keys:
+      'triple_one_shot': (subset, weapon)       — 3 awp/scout in 1s (at most 1)
+      'doubles_one_shot': list of (subset, weapon) — ALL non-overlapping 2 awp/scout in 1s,
+                                                     after subtracting any triple kills
+      'fast_3hs': subset                         — 3 HS combo-weapon kills in 5s (at most 1)
+
+    Math note: a triple uses 3 kills, so in n=4 quad you can't have a triple AND
+    any double (only 1 kill remains). In n=5 ace you CAN have triple + 1 double
+    (2 kills remaining). And double+double is possible in n=4 (4 awp in two pairs)
+    or n=5 (4 awp in two pairs + 1 other).
+
+    Two fast_3hs subsets are mathematically impossible in n<=5 (would need 6 HS kills),
+    so we only track count=1 for that category.
+    """
+    found = {}
+    used_ids = set()
+
+    # Find triple_one_shot first (at most 1 per bucket — math)
+    for w in ONE_SHOT_WEAPONS:
+        subset = _find_one_shot_subset(klst, w, 3, ONE_SHOT_WINDOW)
+        if subset is not None:
+            found['triple_one_shot'] = (subset, w)
+            used_ids.update(id(k) for k in subset)
+            break
+
+    # Find ALL non-overlapping doubles in the remaining kills (could be 0, 1, or 2+)
+    doubles = _find_all_one_shot_doubles(klst, used_ids)
+    if doubles:
+        found['doubles_one_shot'] = doubles
+
+    # Find fast 3hs (at most 1 — needs 3 HS combo weapons, math limits it)
+    fast_3hs = _find_fast_3hs_subset(klst)
+    if fast_3hs is not None:
+        found['fast_3hs'] = fast_3hs
+
+    return found
+
+
+def _format_annotations(subsets):
+    """Convert detected subsets into annotation labels for the info string.
+
+    Each annotation specifies its weapon explicitly, since double/triple are
+    exclusively snipers (awp or scout) and that needs to be unambiguous when
+    the bucket also contains other weapons.
+
+    Multiple doubles in the same bucket are grouped by weapon:
+      - same weapon, count >= 2: 'Nx double with awp'
+      - different weapons: listed separately ('double with awp, double with scout')
+
+    Annotations are emitted in priority order: triple > double > fast 3hs.
+    """
+    annotations = []
+    if 'triple_one_shot' in subsets:
+        _subset, w = subsets['triple_one_shot']
+        annotations.append(f'triple with {_weapon_display(w)}')
+    if 'doubles_one_shot' in subsets:
+        from collections import Counter
+        # Preserve weapon order (first occurrence) so output is deterministic.
+        weapons_seen = []
+        for _subset, w in subsets['doubles_one_shot']:
+            if w not in weapons_seen:
+                weapons_seen.append(w)
+        weapon_counts = Counter(w for _subset, w in subsets['doubles_one_shot'])
+        for weapon in weapons_seen:
+            count = weapon_counts[weapon]
+            disp = _weapon_display(weapon)
+            if count == 1:
+                annotations.append(f'double with {disp}')
+            else:
+                annotations.append(f'{count}x double with {disp}')
+    if 'fast_3hs' in subsets:
+        annotations.append('fast 3hs')
+    return annotations
 
 
 def select_highlights(kills, round_boundaries):
-    """Apply the highlight selection rules used for CSV export:
+    """Apply the highlight selection rules used for CSV/TXT export.
 
-    Include ALL kills a player made in one round if:
-      - 4 or 5 kills (quads and aces), any weapons, any distribution
-      - exactly 3 kills AND all are headshots AND span <= 5s AND all weapons
-        are in {deagle, ak47, m4a1}
-      - exactly 3 kills AND all from AWP AND all within 1 second (triple
-        one-shot)
-      - exactly 2 kills AND both from AWP AND within 1 second (double
-        one-shot)
+    Each (round, killer) bucket gets classified into one of:
 
-    Returns list of streaks (each a list of kill tuples), sorted by first
-    kill time."""
+      n=5:  'ace with weapons' (+ annotations if subsets exist)
+      n=4:  '4k with weapons'  (+ annotations if subsets exist)
+      n=3:
+        - all awp/scout within 1s → 'triple with awp/scout'
+        - all HS + HS-combo weapons + 5s span → 'fast 3hs with weapons'
+        - has a subset of 2 awp/scout within 1s → 'double with awp/scout'
+          (the third kill is treated as extra and not shown in CSV — only
+           the 2 kills that form the double are kept)
+        - else → skipped
+      n=2:
+        - both awp/scout within 1s → 'double with awp/scout'
+        - else → skipped
+
+    Annotations for quad/ace, multiple allowed, in priority order:
+      '(incl. triple)' if 3 awp/scout within 1s exists as a subset
+      '(incl. double)' if 2 awp/scout within 1s exists (when no triple)
+      '(incl. fast 3hs)' if 3 HS combo within 5s exists
+
+    For ace specifically, both triple AND double can coexist (rare: 3-kill
+    one-shot + 2-kill one-shot in different moments of the round). In that
+    case the annotation reads '(incl. triple, double)'.
+
+    Returns a list of dicts:
+      {'kills': [k1, k2, ...], 'category': 'double', 'weapon': 'awp', 'annotations': [...]}
+    """
     from collections import defaultdict
     import bisect
 
@@ -623,8 +970,8 @@ def select_highlights(kills, round_boundaries):
         ftime, killer, victim, _hs, _w = k
         if killer == 0:                   # world damage with no attacker
             continue
-        if killer == victim:              # self-kill: falldamage, own nade, etc.
-            continue                      # doesn't count toward a multikill
+        if killer == victim:              # self-kill (falldamage, own nade, etc)
+            continue
         r = bisect.bisect_left(round_boundaries, ftime) if round_boundaries else 0
         buckets[(r, killer)].append(k)
 
@@ -632,33 +979,84 @@ def select_highlights(kills, round_boundaries):
     for klst in buckets.values():
         klst.sort(key=lambda x: x[0])
         n = len(klst)
+        h = _classify_bucket(klst, n)
+        if h is not None:
+            highlights.append(h)
 
-        if n in (4, 5):
-            highlights.append(klst)
-            continue
-
-        if n == 3:
-            times = [k[0] for k in klst]
-            span = times[-1] - times[0]
-            weapons = [k[4].lower() for k in klst]
-            all_hs = all(k[3] == 1 for k in klst)
-
-            if all_hs and span <= 5.0 and all(w in HS_COMBO_WEAPONS for w in weapons):
-                highlights.append(klst)
-                continue
-            if all(w == "awp" for w in weapons) and span <= 1.0:
-                highlights.append(klst)
-                continue
-
-        if n == 2:
-            times = [k[0] for k in klst]
-            weapons = [k[4].lower() for k in klst]
-            if all(w == "awp" for w in weapons) and times[-1] - times[0] <= 1.0:
-                highlights.append(klst)
-                continue
-
-    highlights.sort(key=lambda s: s[0][0])
+    highlights.sort(key=lambda s: s['kills'][0][0])
     return highlights
+
+
+def _classify_bucket(klst, n):
+    """Apply the rules to a bucket of one player's kills in one round.
+    Returns a highlight dict or None if the bucket isn't a highlight."""
+    if n >= 4:
+        # quad/ace: always a highlight, annotate with notable subsets
+        category = 'ace' if n >= 5 else '4k'
+        subsets = _scan_subsets(klst)
+        annotations = _format_annotations(subsets)
+        return {
+            'kills': klst,
+            'category': category,
+            'weapon': None,             # multiple weapons possible
+            'annotations': annotations,
+        }
+
+    if n == 3:
+        # Try the 3-kill base categories first (full bucket matches one rule)
+        times = [k[0] for k in klst]
+        span = times[-1] - times[0]
+        weapons = [k[4].lower() for k in klst]
+        all_hs = all(k[3] == 1 for k in klst)
+
+        # triple awp/scout: all three same weapon and within 1s
+        for w in ONE_SHOT_WEAPONS:
+            if all(wp == w for wp in weapons) and span <= ONE_SHOT_WINDOW:
+                return {
+                    'kills': klst,
+                    'category': 'triple',
+                    'weapon': w,
+                    'annotations': [],
+                }
+
+        # fast 3hs: all HS, all HS-combo weapons, within 5s
+        if all_hs and all(w in HS_COMBO_WEAPONS for w in weapons) and span <= HS_COMBO_WINDOW:
+            return {
+                'kills': klst,
+                'category': 'fast_3hs',
+                'weapon': None,
+                'annotations': [],
+            }
+
+        # Fall back: maybe there's a 2-kill subset that IS a one-shot double
+        # (the third kill happened later in the round and the bucket-level
+        # rules don't fit, but the double itself is a real wow-moment).
+        for w in ONE_SHOT_WEAPONS:
+            subset = _find_one_shot_subset(klst, w, 2, ONE_SHOT_WINDOW)
+            if subset is not None:
+                return {
+                    'kills': subset,            # only the 2 kills of the double
+                    'category': 'double',
+                    'weapon': w,
+                    'annotations': [],
+                }
+        return None
+
+    if n == 2:
+        times = [k[0] for k in klst]
+        weapons = [k[4].lower() for k in klst]
+        span = times[-1] - times[0]
+        for w in ONE_SHOT_WEAPONS:
+            if all(wp == w for wp in weapons) and span <= ONE_SHOT_WINDOW:
+                return {
+                    'kills': klst,
+                    'category': 'double',
+                    'weapon': w,
+                    'annotations': [],
+                }
+        return None
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +1128,8 @@ def parse_demo_full(demo_path):
         raise ValueError("DeathMsg user message registration not found")
 
     slot_names = find_player_names(netmsgs)
+    name_history = find_name_history(netmsgs)
+    model_history = find_model_history(netmsgs)
     kills = find_kills(netmsgs, deathmsg_id)
     round_events = find_round_events(netmsgs)
     boundaries = [t for t, _ in round_events]
@@ -756,6 +1156,38 @@ def parse_demo_full(demo_path):
         get_ftime=lambda e: e[0],
         set_ftime=lambda e, t: (t, e[1]),
     )
+    # Apply server-time to the name history entries too — so a lookup with
+    # a kill's server time will hit the right name change.
+    name_history_st = {}
+    for slot, entries in name_history.items():
+        if not entries:
+            continue
+        translated = apply_server_time_to_events(
+            entries, svc_samples,
+            get_ftime=lambda e: e[0],
+            set_ftime=lambda e, t: (t, e[1]),
+        )
+        name_history_st[slot] = translated
+
+    # Same for model history — used to identify team-kills (same side at the
+    # moment of the kill) and exclude them from highlight counting.
+    model_history_st = {}
+    for slot, entries in model_history.items():
+        if not entries:
+            continue
+        translated = apply_server_time_to_events(
+            entries, svc_samples,
+            get_ftime=lambda e: e[0],
+            set_ftime=lambda e, t: (t, e[1]),
+        )
+        model_history_st[slot] = translated
+
+    # Filter out team-kills from the kill list before highlight selection.
+    # A team-kill is a real DeathMsg event but it shouldn't bump n in a
+    # bucket — 4 enemies + 1 teammate killed should read as a quad, not an
+    # ace. Conservative: if either side is unknown for a kill, we keep it
+    # (don't drop legitimate highlights when model data is partial).
+    kills = [k for k in kills if not is_teammate_kill(k, model_history_st)]
 
     # Also report a robust offset estimate for diagnostics/UI display.
     # Use a median across early samples — the very first sample is often
@@ -767,23 +1199,35 @@ def parse_demo_full(demo_path):
     else:
         initial_offset = 0.0
 
-    # Detect the real match start: the first restart followed by ≥15 clean
-    # rounds. Anything before that is warm-up or false starts and should
-    # not produce highlights.
-    match_start = find_match_start(round_events_st, min_rounds_in_half=15)
-    if match_start is not None:
-        kills_for_highlights = [k for k in kills if k[0] >= match_start]
-        boundaries_for_highlights = [b for b in boundaries if b >= match_start]
-    else:
-        # No qualifying match start — likely a casual/practice demo,
-        # or a partial recording. Use everything we have.
-        kills_for_highlights = kills
-        boundaries_for_highlights = boundaries
-
     # POV/HLTV detection. POV demos contain ConsoleCommand frames (the
     # recording client's keypresses); HLTV demos don't, since HLTV is a
     # server-side spectator. See detect_demo_type for details.
     demo_type = detect_demo_type(info["frame_type_counts"])
+
+    # Detect the real match start: the first restart followed by ≥15 clean
+    # rounds. Anything before that is warm-up or false starts.
+    #
+    # Apply this filter ONLY for HLTV demos. Two reasons:
+    #
+    # 1. HLTV recordings always start before the match begins (proxy is set
+    #    up to capture warm-up, sides, OT). The first-restart-with-15-rounds
+    #    heuristic is rock-solid here.
+    #
+    # 2. POV recordings are made by the player intentionally — typically
+    #    starting at round 1 of the first half because they want to capture
+    #    real match action. Warm-up multikills in POV are extremely rare
+    #    (you don't usually record yourself farming AFK teammates). And the
+    #    cost of misfiring is high: if a player started recording mid-first-
+    #    half and got an ace before the side switch, the warm-up filter
+    #    would mistake the side-switch restart for the match start and drop
+    #    the ace. Skipping the filter for POV avoids that loss.
+    match_start = find_match_start(round_events_st, min_rounds_in_half=15)
+    if demo_type == "HLTV" and match_start is not None:
+        kills_for_highlights = [k for k in kills if k[0] >= match_start]
+        boundaries_for_highlights = [b for b in boundaries if b >= match_start]
+    else:
+        kills_for_highlights = kills
+        boundaries_for_highlights = boundaries
 
     # For POV demos, identify the recording player and filter highlights
     # to keep only their own multikills. Other players' kills are still
@@ -794,7 +1238,12 @@ def parse_demo_full(demo_path):
     if demo_type == "POV":
         recorder_slot = find_recorder_slot(netmsgs)
         if recorder_slot is not None:
-            recorder_name = slot_names.get(recorder_slot)
+            # Show the name they used MOST of the demo, not the last name.
+            # Esports players often rename to 'gg'/'kk'/'bb' after the match.
+            recorder_name = most_common_name(
+                name_history_st, recorder_slot,
+                fallback=slot_names.get(recorder_slot),
+            )
             recorder_entity = recorder_slot + 1
             kills_for_highlights = [
                 k for k in kills_for_highlights if k[1] == recorder_entity
@@ -807,6 +1256,8 @@ def parse_demo_full(demo_path):
         "map_name": info["map_name"],
         "demo_type": demo_type,
         "slot_names": slot_names,
+        "name_history": name_history_st,    # for name-at-time-of-kill lookup
+        "model_history": model_history_st,  # for team/side lookup per kill
         "highlights": highlights,
         "server_time_offset": initial_offset,
         "svc_sample_count": len(svc_samples),
@@ -833,29 +1284,91 @@ def _weapon_display(weapon):
 COUNT_LABELS = {2: "2k", 3: "3k", 4: "4k", 5: "ace"}
 
 
-def build_info_string(streak):
-    """Build the 'info' CSV column: '<label> with <weapons>'."""
-    label = COUNT_LABELS.get(len(streak), f"{len(streak)}k")
+CATEGORY_LABELS = {
+    'ace': 'ace',
+    '4k': '4k',
+    'triple': 'triple',
+    'double': 'double',
+    'fast_3hs': 'fast 3hs',
+}
+
+
+def build_info_string(highlight):
+    """Build the 'info' CSV column.
+
+    For category-with-known-weapon highlights (double/triple, fast_3hs):
+      'double with awp'
+      'triple with scout'
+      'fast 3hs with deagle, ak47'
+
+    For quad/ace (multiple weapons possible) with optional annotations:
+      '4k with m4a1, awp'
+      'ace with m4a1, awp (incl. triple)'
+      'ace with m4a1, awp (incl. triple, double)'
+    """
+    cat = highlight['category']
+    label = CATEGORY_LABELS.get(cat, cat)
+    kills = highlight['kills']
+
+    if cat in ('double', 'triple'):
+        # Specific one-shot category — weapon is known and fixed
+        weapon_disp = _weapon_display(highlight['weapon'])
+        return f"{label} with {weapon_disp}"
+
+    if cat == 'fast_3hs':
+        # 3 HS combo — list the weapons used in this combo
+        seen = []
+        for _t, _k, _v, _hs, w in kills:
+            disp = _weapon_display(w)
+            if disp not in seen:
+                seen.append(disp)
+        return f"{label} with {', '.join(seen)}"
+
+    # Quad / ace: list all weapons, then any annotations in parens
     seen = []
-    for _t, _k, _v, _hs, w in streak:
+    for _t, _k, _v, _hs, w in kills:
         disp = _weapon_display(w)
         if disp not in seen:
             seen.append(disp)
-    return f"{label} with {', '.join(seen)}"
+    info = f"{label} with {', '.join(seen)}"
+    if highlight.get('annotations'):
+        info += f" (incl. {', '.join(highlight['annotations'])})"
+    return info
 
 
 def build_csv_rows(parsed):
     """Build CSV rows from a parsed demo dict.
-    Returns list of [demo_name, map, player_name, highlight, info]."""
+    Returns list of [demo_name, map, player_name, highlight, info].
+
+    Names are looked up AT THE TIME OF EACH KILL using name_history. This
+    handles the common esports case where a player renames after the match
+    (often to 'gg' / 'kk' / 'bb' as a sign-off) — earlier kills should still
+    be attributed to their match name, not the post-match alias.
+
+    Killer name uses the time of the FIRST kill in the streak (stable for
+    the whole streak so the output reads naturally). Victim names use the
+    time of EACH kill individually.
+    """
     rows = []
     slot_names = parsed["slot_names"]
+    name_history = parsed.get("name_history", {})
+
     for streak in parsed["highlights"]:
-        killer_idx = streak[0][1]
-        killer_name = slot_names.get(killer_idx - 1, f"player_{killer_idx}")
+        kills = streak['kills']
+        killer_idx = kills[0][1]
+        # Killer name: use time of FIRST kill in streak for consistency
+        killer_name = name_at_time(
+            name_history, killer_idx - 1, kills[0][0],
+            fallback=slot_names.get(killer_idx - 1, f"player_{killer_idx}"),
+        )
 
         highlight_lines = []
-        for ftime, _k, v_idx, hs, weapon in streak:
-            victim = slot_names.get(v_idx - 1, f"player_{v_idx}")
+        for ftime, _k, v_idx, hs, weapon in kills:
+            # Victim name: at the time of THIS kill specifically
+            victim = name_at_time(
+                name_history, v_idx - 1, ftime,
+                fallback=slot_names.get(v_idx - 1, f"player_{v_idx}"),
+            )
             highlight_lines.append(format_kill(ftime, killer_name, victim, hs, weapon))
 
         rows.append([
@@ -886,9 +1399,14 @@ def _fmt_time(ftime):
 
 
 def format_kill(ftime, killer_name, victim_name, headshot, weapon):
+    """Format a single kill line.
+
+    Headshot kills are wrapped in '*** ***' so that mouse-eye scanning the
+    CSV/TXT output picks them out quickly — feedback from movie-makers
+    confirmed this is genuinely useful even though it adds visual noise."""
     ts = _fmt_time(ftime)
     if headshot:
-        return f"{ts}: {killer_name} killed {victim_name} with a headshot from {weapon}"
+        return f"*** {ts}: {killer_name} killed {victim_name} with a headshot from {weapon} ***"
     return f"{ts}: {killer_name} killed {victim_name} with {weapon}"
 
 
@@ -933,6 +1451,13 @@ def main():
     ap.add_argument("--flat", action="store_true",
                     help="In --rounds mode, skip '=== QUAD ===' headers — "
                          "emit just the kill lines, one streak after another.")
+    ap.add_argument("--highlights", action="store_true",
+                    help="Use the exact same highlight selection logic as the "
+                         "web UI: aces, quads, fast 3hs, triple/double awp/scout, "
+                         "with subset annotations '(incl. triple/double)'. "
+                         "POV-aware (filters to recorder's own kills) and "
+                         "applies the HLTV warm-up filter. This is the "
+                         "recommended drag-and-drop mode.")
     ap.add_argument("--no-server-time", action="store_true",
                     help="Output demo time (from 0:00) instead of server time "
                          "(which matches the timer shown in the game's demo player).")
@@ -945,6 +1470,37 @@ def main():
     if not demo_path.is_file():
         print(f"File not found: {demo_path}", file=sys.stderr)
         sys.exit(1)
+
+    # --highlights mode: short-circuit and use the same code path as the UI.
+    # This guarantees CLI output stays in sync with the web UI even as new
+    # highlight categories or filters are added.
+    if args.highlights:
+        try:
+            parsed = parse_demo_full(str(demo_path))
+        except Exception as e:
+            print(f"ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+            sys.exit(2)
+
+        out_path = demo_path.with_name(demo_path.stem + "_highlights.txt")
+        with open(out_path, "w", encoding="utf-8") as f:
+            rows = build_csv_rows(parsed)
+            f.write(f"# {parsed['demo_name']}  map={parsed['map_name']}  "
+                    f"type={parsed['demo_type']}")
+            if parsed.get('recorder_name'):
+                f.write(f"  recorder={parsed['recorder_name']}")
+            f.write(f"\n# highlights: {len(rows)}\n\n")
+            for row in rows:
+                _demo, _map, player, lines, info = row
+                f.write(f"{info}  ({player})\n")
+                for line in lines.split('\n'):
+                    f.write(f"  {line}\n")
+                f.write('\n')
+        print(f"  type={parsed['demo_type']}  map={parsed['map_name']}  "
+              f"highlights={len(rows)}")
+        if parsed.get('recorder_name'):
+            print(f"  recorder={parsed['recorder_name']}")
+        print(f"  -> {out_path.name}")
+        return
 
     print(f"Reading {demo_path} ({demo_path.stat().st_size:,} bytes)")
     data = demo_path.read_bytes()

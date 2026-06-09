@@ -34,7 +34,7 @@ MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB per request
 # string when shipping a new release; it appears in the browser tab title
 # and in the page header. We deliberately do NOT compute it from git tags
 # or anywhere else — keep one literal that's grep-able.
-VERSION = "1.1"
+VERSION = "1.2"
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +64,7 @@ INDEX_HTML = r"""<!doctype html>
     font-size: 14px;
   }
   main {
-    max-width: 1200px;
+    max-width: 1400px;
     margin: 0 auto;
   }
   h1 {
@@ -166,6 +166,7 @@ INDEX_HTML = r"""<!doctype html>
   }
   .log .ok  { color: var(--good); }
   .log .err { color: #f07174; }
+  .log .pending { color: #e0a458; font-style: italic; }
   table {
     margin-top: 1.5rem; width: 100%;
     border-collapse: collapse;
@@ -187,6 +188,17 @@ INDEX_HTML = r"""<!doctype html>
   }
   tr:last-child td { border-bottom: 0; }
   td.highlight { white-space: pre; color: #cdd6df; }
+  /* Column sizing — keep the highlight (kill log) flexible and give the
+     info column enough room so labels like "4k with m4a1, usp" stay on
+     one line instead of wrapping word-by-word. */
+  td.col-demo, th.col-demo     { width: 180px; word-break: break-all; }
+  td.col-map, th.col-map       { width: 90px; }
+  td.col-player, th.col-player { width: 140px; word-break: break-word; }
+  td.col-info, th.col-info {
+    min-width: 220px; max-width: 320px;
+    word-break: keep-all;        /* don't break inside short tokens */
+    overflow-wrap: normal;        /* only wrap at natural word boundaries */
+  }
   td.fav-cell {
     text-align: center;
     width: 1%;
@@ -279,6 +291,7 @@ function logLine(text, cls) {
   span.textContent = text + "\n";
   log.appendChild(span);
   log.scrollTop = log.scrollHeight;
+  return span;            // returned so the caller can update it in-place
 }
 
 // Each row gets a stable id assigned at insertion time so favorites
@@ -323,8 +336,17 @@ function renderTable() {
   exportBtn.disabled = false;
 
   const headers = ['demo_name', 'map', 'player_name', 'highlight', 'info'];
+  // Short class names — keep header text intact, just tag each cell with
+  // its column for CSS targeting.
+  const colClass = {
+    demo_name:   'col-demo',
+    map:         'col-map',
+    player_name: 'col-player',
+    highlight:   'highlight',
+    info:        'col-info',
+  };
   let html = '<table><thead><tr>';
-  for (const h of headers) html += `<th>${h}</th>`;
+  for (const h of headers) html += `<th class="${colClass[h]}">${h}</th>`;
   html += '<th class="fav-th"></th>';   // favorite column header
   html += '</tr></thead><tbody>';
 
@@ -334,8 +356,7 @@ function renderTable() {
     html += `<tr data-row-id="${id}">`;
     headers.forEach((h, i) => {
       const v = r[i] === null || r[i] === undefined ? '' : String(r[i]);
-      const cls = (h === 'highlight') ? 'highlight' : '';
-      html += `<td class="${cls}">${escapeHtml(v)}</td>`;
+      html += `<td class="${colClass[h]}">${escapeHtml(v)}</td>`;
     });
     const star = meta.favorite ? '\u2605' : '\u2606';   // ★ vs ☆
     const favCls = meta.favorite ? 'fav-cell active' : 'fav-cell';
@@ -383,29 +404,51 @@ function escapeHtml(s) {
 
 async function handleFiles(files) {
   if (!files || files.length === 0) return;
-  status.textContent = `Processing ${files.length} demo${files.length === 1 ? '' : 's'}…`;
+  const total = files.length;
+  const startCount = orderedIds.length;
+  let processed = 0;
 
   for (const f of files) {
-    logLine(`→ ${f.name} (${(f.size/1024/1024).toFixed(1)} MB)`);
+    processed += 1;
+    // Top-level progress counter — visible at all times, even if log is scrolled
+    status.textContent = `Processing ${processed}/${total}: ${f.name}…`;
+
+    // Add a placeholder line that we'll update in place when the demo finishes.
+    // This keeps the "→ name (size)  ... processing" visible while waiting,
+    // so the user can see what's currently being worked on.
+    const lineSpan = logLine(
+      `→ ${f.name} (${(f.size/1024/1024).toFixed(1)} MB)  … processing`,
+      'pending'
+    );
+
     const form = new FormData();
     form.append('demo', f);
     try {
       const resp = await fetch('/parse', { method: 'POST', body: form });
       const data = await resp.json();
       if (!resp.ok) {
-        logLine(`   ERROR: ${data.error || resp.statusText}`, 'err');
+        lineSpan.className = 'err';
+        lineSpan.textContent = `→ ${f.name}: ERROR: ${data.error || resp.statusText}\n`;
         continue;
       }
       const added = data.rows.length;
       addRows(data.rows);
-      logLine(`   ok: ${added} highlight${added === 1 ? '' : 's'} `
-              + `(${data.demo_type}, ${data.map})`, 'ok');
+      // Replace the "processing" placeholder with the final result line
+      lineSpan.className = 'ok';
+      lineSpan.textContent =
+        `→ ${f.name}: ${added} highlight${added === 1 ? '' : 's'} `
+        + `(${data.demo_type}, ${data.map})\n`;
     } catch (e) {
-      logLine(`   ERROR: ${e.message}`, 'err');
+      lineSpan.className = 'err';
+      lineSpan.textContent = `→ ${f.name}: ERROR: ${e.message}\n`;
     }
     renderTable();
   }
-  status.textContent = `${orderedIds.length} highlight${orderedIds.length === 1 ? '' : 's'} ready.`;
+
+  const totalHighlights = orderedIds.length - startCount;
+  status.textContent =
+    `Done! ${totalHighlights} highlight${totalHighlights === 1 ? '' : 's'} `
+    + `from ${total} demo${total === 1 ? '' : 's'}.`;
 }
 
 // Note: <label class="drop"> already wraps the file input, so clicking

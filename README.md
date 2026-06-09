@@ -4,7 +4,7 @@ Extract multikill highlights from Counter-Strike 1.6 demo files (`.dem`).
 Runs entirely on your computer — no Python installation, no internet required,
 no data ever leaves your machine.
 
-**Made by THUNDERGOD** · [v1.1](#version-history)
+**Made by THUNDERGOD** · [v1.2](#version-history)
 
 ---
 
@@ -84,20 +84,21 @@ with `.txt` output:
 
 Five columns, one row per highlight:
 
-| Column        | Example                                              |
-|---------------|------------------------------------------------------|
-| `demo_name`   | `demo1.dem`                                          |
-| `map`         | `de_dust2`                                           |
-| `player_name` | `NBD\|sVIKEN- svalket savle navle`                   |
-| `highlight`   | Multi-line killfeed for the streak                   |
-| `info`        | `3k with ak` · `ace with m4a1, usp` · `2k with awp`  |
+| Column        | Example                                                          |
+|---------------|------------------------------------------------------------------|
+| `demo_name`   | `demo1.dem`                                                      |
+| `map`         | `de_dust2`                                                       |
+| `player_name` | `NBD\|sVIKEN- svalket savle navle`                               |
+| `highlight`   | Multi-line killfeed for the streak                               |
+| `info`        | `fast 3hs with ak47` · `ace with m4a1, usp` · `double with awp`  |
 
-The `highlight` column contains all kills in the streak, one per line:
+The `highlight` column contains all kills in the streak, one per line.
+Headshot lines are wrapped in `*** ***` for easy scanning:
 
 ```
-19:54: NBD|sVIKEN killed DarkIT Azid with a headshot from ak47
-19:56: NBD|sVIKEN killed DarkIT zRK with a headshot from ak47
-19:59: NBD|sVIKEN killed DarkIT ENOkSEN with a headshot from ak47
+*** 19:54: NBD|sVIKEN killed DarkIT Azid with a headshot from ak47 ***
+*** 19:56: NBD|sVIKEN killed DarkIT zRK with a headshot from ak47 ***
+*** 19:59: NBD|sVIKEN killed DarkIT ENOkSEN with a headshot from ak47 ***
 ```
 
 Timestamps are in **server time** — they match the counter shown by the
@@ -105,25 +106,57 @@ in-game demo player, so you can scrub straight to them.
 
 ## Highlight selection rules
 
-The parser only exports "meaningful" multikills, not every double. An event
-counts as a highlight if it matches **any** of these conditions:
+The parser exports "meaningful" multikills with descriptive labels. Each
+player's kills in a single round are grouped into a bucket, and the bucket
+is classified by these rules (in priority order):
 
-| Condition                                                               | Included as |
-|-------------------------------------------------------------------------|-------------|
-| 4 kills in one round, any weapons                                       | `4k`        |
-| 5 kills in one round (ace), any weapons                                 | `ace`       |
-| 3 kills, all headshots, within 5 seconds, weapon ∈ {Deagle, AK, M4A1}   | `3k`        |
-| 3 kills from AWP in a single second (one-shot triple)                   | `3k`        |
-| 2 kills from AWP in a single second (one-shot double)                   | `2k`        |
+| Bucket | Condition | Label |
+|--------|-----------|-------|
+| 5 kills | Any weapons | `ace with <weapons>` |
+| 4 kills | Any weapons | `4k with <weapons>` |
+| 3 kills | All AWP **OR** all scout within 1s | `triple with awp` / `triple with scout` |
+| 3 kills | All headshots, within 5s, all from {Deagle, AK, M4A1} | `fast 3hs with <weapons>` |
+| 3 kills | 2 of them are AWP/scout one-shot (Δ ≤ 1s) + 1 outlier | `double with awp/scout` *(only the 2 close kills are shown)* |
+| 2 kills | Both AWP **OR** both scout within 1s | `double with awp` / `double with scout` |
 
-**Deliberately filtered out:**
-- Self-kills (fall damage, own grenade, suicide)
-- Regular 2-3 kill clusters that don't meet the criteria above
-- Kills where the attacker is the same as the victim
+### Subset annotations (for 4k / ace)
 
-If you want different rules, edit the `select_highlights()` function in
-`cs16_killfeed.py` — rules are declared at the top of the function and
-easy to change.
+When a quad or ace contains a notable sub-event, it's annotated with
+`(incl. ...)`:
+
+| Sub-event | Annotation |
+|-----------|------------|
+| 3 AWP/scout in ≤1s inside the bucket | `(incl. triple with awp)` |
+| 2 AWP/scout in ≤1s inside the bucket | `(incl. double with awp)` |
+| Two separate doubles in the bucket | `(incl. 2x double with awp)` |
+| 3 HS combo (deagle/ak/m4a1 in 5s) inside | `(incl. fast 3hs)` |
+
+Multiple annotations can co-exist (in an ace, you can have triple+double or
+double+fast 3hs):
+
+```
+ace with awp (incl. triple with awp, double with awp)
+ace with awp, deagle, ak, m4a1 (incl. double with awp, fast 3hs)
+4k with awp (incl. 2x double with awp)
+```
+
+### Deliberately filtered out
+
+- Self-kills (fall damage, own grenade, suicide) — `killer == victim`
+- World damage with no attacker
+- **Team-kills** — a kill where killer and victim are on the same side at
+  that moment. Side is determined from each player's character model
+  (which updates at side switches), so a quad + 1 TK reads correctly as
+  `4k`, not `ace`. If model data is missing for either party, the kill is
+  kept (conservative default — no false TK drops).
+- "Slow 3K" with AWP (3 AWP across the round with no Δ ≤ 1s pair) — not
+  interesting since AWP is slow and 3 kills over a long round isn't visually
+  impressive
+- Regular 2-kill clusters that aren't AWP/scout one-shot
+
+If you want different rules, edit the `select_highlights()` and
+`_classify_bucket()` functions in `cs16_killfeed.py` — rules are explicitly
+declared and easy to change.
 
 ## Server time vs demo time
 
@@ -250,6 +283,61 @@ If they're off by more than a second, please open an issue with the demo
 file attached (if sharing is OK) or at least the first 10 MB of it.
 
 ## Version history
+
+### v1.2
+
+**New highlight categories and naming**
+- Scout added to one-shot multikill rules — `double with scout` and
+  `triple with scout` are now detected just like the AWP equivalents
+- Renamed labels for clarity:
+  - `double with awp` / `triple with awp` (was `2k with awp` / `3k with awp`)
+  - `fast 3hs with deagle, ak47, m4a1` (was `3k with deagle, ak47, m4a1`)
+- Subset annotations on quads and aces — when a 4k or ace contains a
+  notable sub-event, it's tagged inline:
+  - `4k with awp, deagle (incl. triple with awp)`
+  - `ace with awp (incl. 2x double with awp)`
+  - `ace with awp, deagle, ak, m4a1 (incl. double with awp, fast 3hs)`
+- Slow 3K AWP removed as a separate category — 3 AWP across a round
+  with no sub-1-second pair was rarely visually impressive
+
+**Bug fixes**
+- 2 AWP kills in the same millisecond + 1 extra AWP kill later in the same
+  round is now correctly classified as `double with awp` (only the 2 close
+  kills are shown). Previously it fell through every rule and the event was
+  lost entirely.
+- Player names are now resolved **at the time of each kill**, not from the
+  last name seen in the demo. Esports players who rename to `gg` / `kk` /
+  `bb` after the match no longer corrupt earlier kill attribution.
+- Team-kills are now excluded from highlight counting. A player who killed
+  4 enemies + 1 teammate in a single round is correctly reported as `4k`
+  rather than `ace`. Side detection uses the player's character model from
+  userinfo (CT models: urban, sas, gign, gsg9, spetsnaz; T models: terror,
+  leet, guerilla, arctic, militia) — this updates reliably at half-time
+  side switches, so kills are attributed to the right side throughout the
+  demo. If model data is missing for either party, the kill is kept
+  conservatively (no false TK drops).
+
+**UI/UX**
+- Headshot kill lines wrapped in `*** ***` again — restored after movie-maker
+  feedback that the visual marker speeds up scanning the highlights output
+- Per-demo progress is now visible while parsing a batch: each demo line
+  starts as orange italic `… processing` while it's being parsed, then
+  flips in-place to green `ok` (or red `ERROR`) when done. The top status
+  shows `Processing 3/20: filename…` so you always know which demo is
+  currently being worked on and how many remain. Final message reads
+  `Done! 12 highlights from 20 demos.`
+
+**CLI**
+- New `--highlights` flag uses the exact same selection logic as the web UI.
+  The `run_round_multikills.bat` drag-and-drop launcher now uses this flag,
+  so its `.txt` output stays in sync with what the UI shows.
+
+**HLTV vs POV**
+- The warm-up filter now applies only to HLTV demos. POV recordings are
+  always intentional (a player chose to record their game), and the cost of
+  filtering them is high — if a player started recording mid-first-half
+  and got an ace before the side switch, the warm-up filter could mistake
+  the side-switch restart for the match start and drop the ace.
 
 ### v1.1
 
