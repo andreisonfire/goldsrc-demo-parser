@@ -34,7 +34,7 @@ MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB per request
 # string when shipping a new release; it appears in the browser tab title
 # and in the page header. We deliberately do NOT compute it from git tags
 # or anywhere else — keep one literal that's grep-able.
-VERSION = "1.2"
+VERSION = "1.3"
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +167,7 @@ INDEX_HTML = r"""<!doctype html>
   .log .ok  { color: var(--good); }
   .log .err { color: #f07174; }
   .log .pending { color: #e0a458; font-style: italic; }
+  .log .warn { color: #e0a458; }
   table {
     margin-top: 1.5rem; width: 100%;
     border-collapse: collapse;
@@ -434,10 +435,19 @@ async function handleFiles(files) {
       const added = data.rows.length;
       addRows(data.rows);
       // Replace the "processing" placeholder with the final result line
-      lineSpan.className = 'ok';
-      lineSpan.textContent =
-        `→ ${f.name}: ${added} highlight${added === 1 ? '' : 's'} `
-        + `(${data.demo_type}, ${data.map})\n`;
+      if (data.modded_server) {
+        // Demo parsed OK but uses an extended DeathMsg format we don't
+        // support yet. Explain instead of leaving the user guessing.
+        lineSpan.className = 'warn';
+        lineSpan.textContent =
+          `→ ${f.name}: kill events not supported `
+          + `(modded server — ReHLDS/AMX plugins). No highlights extracted.\n`;
+      } else {
+        lineSpan.className = 'ok';
+        lineSpan.textContent =
+          `→ ${f.name}: ${added} highlight${added === 1 ? '' : 's'} `
+          + `(${data.demo_type}, ${data.map})\n`;
+      }
     } catch (e) {
       lineSpan.className = 'err';
       lineSpan.textContent = `→ ${f.name}: ERROR: ${e.message}\n`;
@@ -676,6 +686,7 @@ class Handler(BaseHTTPRequestHandler):
                     "map": parsed["map_name"],
                     "demo_type": parsed["demo_type"],
                     "highlight_count": len(parsed["highlights"]),
+                    "modded_server": parsed.get("modded_server", False),
                 }
                 return self._send_json(resp)
             finally:

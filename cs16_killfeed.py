@@ -554,6 +554,66 @@ def most_common_name(history, slot, fallback=None):
     return max(durations.items(), key=lambda x: x[1])[0]
 
 
+def has_modded_deathmsg(netmsgs, deathmsg_id):
+    """Detect whether this demo uses a modded-server DeathMsg format.
+
+    Signature of a modded payload: header bytes look valid (killer/victim in
+    range, headshot 0/1, weapon name is a known CS 1.6 weapon) but the null
+    terminator is NOT at the end of the payload — extra bytes follow. These
+    extras are usually kill_id and flag fields inserted by ReHLDS /
+    ReGameDLL / AMX plugins.
+
+    GSDP's strict find_kills validation requires the null at the end, so
+    modded demos silently produce zero kills. Detecting the modded signature
+    lets us surface a "not supported" warning in the UI instead of leaving
+    the user guessing.
+
+    Fast: returns True on the first modded payload found; no need to scan
+    the whole demo.
+    """
+    if deathmsg_id is None:
+        return False
+    for _ftime, msg in netmsgs:
+        i = 0
+        L = len(msg)
+        while i < L - 5:
+            if msg[i] == deathmsg_id:
+                length = msg[i + 1]
+                # Accept a slightly wider length range than find_kills so we
+                # catch typical modded payload sizes (15–25 bytes).
+                if 5 <= length <= 50 and i + 2 + length <= L:
+                    killer = msg[i + 2]
+                    victim = msg[i + 3]
+                    headshot = msg[i + 4]
+                    if (
+                        0 <= killer <= 32
+                        and 1 <= victim <= 32
+                        and headshot in (0, 1)
+                    ):
+                        payload_end = i + 2 + length
+                        weapon_end = msg.find(b"\x00", i + 5, payload_end)
+                        # Signature: weapon's null IS present but NOT at end
+                        if (
+                            weapon_end > i + 5
+                            and weapon_end < payload_end - 1
+                        ):
+                            weapon_bytes = msg[i + 5 : weapon_end]
+                            try:
+                                weapon = weapon_bytes.decode("ascii")
+                            except UnicodeDecodeError:
+                                weapon = ""
+                            if (
+                                weapon
+                                and all(c.isalnum() or c == "_" for c in weapon)
+                                and weapon.lower() in KNOWN_WEAPONS
+                            ):
+                                return True
+                    i += 1
+                    continue
+            i += 1
+    return False
+
+
 def find_kills(netmsgs, deathmsg_id):
     """Scan all NetMsg payloads for variable-length user message <deathmsg_id>.
     Wire (variable-size user msg): byte id, byte length, then <length> bytes.
@@ -1251,6 +1311,14 @@ def parse_demo_full(demo_path):
 
     highlights = select_highlights(kills_for_highlights, boundaries_for_highlights)
 
+    # If we found no highlights and very few kills overall, check whether
+    # the demo uses a modded DeathMsg format (extended payload with
+    # trailing bytes). In that case we can surface a "not supported"
+    # warning in the UI instead of silently returning zero.
+    modded_server = False
+    if not highlights and len(kills) < 5:
+        modded_server = has_modded_deathmsg(netmsgs, deathmsg_id)
+
     return {
         "demo_name": Path(demo_path).name,
         "map_name": info["map_name"],
@@ -1265,6 +1333,7 @@ def parse_demo_full(demo_path):
         "round_events_count": len(round_events_st),
         "recorder_slot": recorder_slot,
         "recorder_name": recorder_name,
+        "modded_server": modded_server,
     }
 
 
@@ -1401,12 +1470,14 @@ def _fmt_time(ftime):
 def format_kill(ftime, killer_name, victim_name, headshot, weapon):
     """Format a single kill line.
 
-    Headshot kills are wrapped in '*** ***' so that mouse-eye scanning the
-    CSV/TXT output picks them out quickly — feedback from movie-makers
-    confirmed this is genuinely useful even though it adds visual noise."""
+    Headshot kills are wrapped in '*** ***' so mouse-eye scanning picks them
+    out quickly — feedback from movie-makers confirmed this is genuinely
+    useful. The asterisks go AFTER the timestamp so that timestamps align
+    vertically across all lines regardless of HS status (matches
+    ColDemoPlayer output style)."""
     ts = _fmt_time(ftime)
     if headshot:
-        return f"*** {ts}: {killer_name} killed {victim_name} with a headshot from {weapon} ***"
+        return f"{ts}: *** {killer_name} killed {victim_name} with a headshot from {weapon} ***"
     return f"{ts}: {killer_name} killed {victim_name} with {weapon}"
 
 

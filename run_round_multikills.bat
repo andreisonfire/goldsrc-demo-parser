@@ -9,25 +9,28 @@ REM    plus annotations like '(incl. triple)' / '(incl. double)'.
 REM
 REM  POV-aware (filters to recorder's own kills) and applies the
 REM  HLTV warm-up filter automatically.
+REM
+REM  Tries cs16_killfeed.exe first, falls back to cs16_killfeed.py
+REM  through Python if the .exe isn't next to this .bat.
 REM ============================================================
 setlocal enabledelayedexpansion
 
-where python >nul 2>nul
-if errorlevel 1 (
-    where py >nul 2>nul
-    if errorlevel 1 (
-        echo [ERROR] Python not found in PATH.
-        pause
-        exit /b 1
+REM --- Locate the runner: .exe or .py + Python ---
+set "RUNNER="
+if exist "%~dp0cs16_killfeed.exe" (
+    set "RUNNER=%~dp0cs16_killfeed.exe"
+) else if exist "%~dp0cs16_killfeed.py" (
+    where python >nul 2>nul
+    if not errorlevel 1 (
+        set "RUNNER=python %~dp0cs16_killfeed.py"
+    ) else (
+        where py >nul 2>nul
+        if not errorlevel 1 set "RUNNER=py %~dp0cs16_killfeed.py"
     )
-    set "PY=py"
-) else (
-    set "PY=python"
 )
 
-set "SCRIPT=%~dp0cs16_killfeed.py"
-if not exist "%SCRIPT%" (
-    echo [ERROR] cs16_killfeed.py not found next to this .bat
+if "%RUNNER%"=="" (
+    echo [ERROR] Neither cs16_killfeed.exe nor cs16_killfeed.py+Python found next to this .bat.
     pause
     exit /b 1
 )
@@ -56,7 +59,7 @@ echo.
 echo ============================================================
 echo  Processing: %~nx1
 echo ============================================================
-"%PY%" "%SCRIPT%" "%~1" --highlights
+%RUNNER% "%~1" --highlights
 if errorlevel 1 echo  [!] Script exited with error on %~nx1
 shift
 goto loop

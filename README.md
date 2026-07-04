@@ -4,7 +4,7 @@ Extract multikill highlights from Counter-Strike 1.6 demo files (`.dem`).
 Runs entirely on your computer — no Python installation, no internet required,
 no data ever leaves your machine.
 
-**Made by THUNDERGOD** · [v1.2](#version-history)
+**Made by THUNDERGOD** · [v1.3](#version-history)
 
 ---
 
@@ -283,6 +283,34 @@ If they're off by more than a second, please open an issue with the demo
 file attached (if sharing is OK) or at least the first 10 MB of it.
 
 ## Version history
+
+### v1.3
+
+**Formatting**
+- Headshot markers `***` moved from BEFORE the timestamp to AFTER, so
+  timestamps align vertically across all lines regardless of HS status.
+  Matches the ColDemoPlayer output style.
+  - Before: `*** 48:23: X killed Y with a headshot from usp ***`
+  - After:  `48:23: *** X killed Y with a headshot from usp ***`
+
+**UI/UX**
+- Modded-server demos are now flagged with a yellow warning in the log
+  instead of silently returning zero highlights. Message: "kill events
+  not supported (modded server — ReHLDS/AMX plugins)". Detection works
+  by looking for DeathMsg payloads that pass basic sanity checks but
+  have extra bytes after the weapon name — the signature of servers
+  running ReHLDS / ReGameDLL with kill-tracking AMX plugins.
+
+**Launchers**
+- `run_ui.bat`, `run_round_multikills.bat`, and `run_all_kills.bat` now
+  try the compiled `.exe` first and fall back to running the `.py`
+  through Python if the `.exe` isn't next to them. Same batch file works
+  for both release and dev layouts.
+
+**Not changed**
+- The parser core is unchanged from v1.2. Modded-server demos are still
+  not fully parsed — only detected and warned about. Vanilla server
+  demos (all pro CS 1.6 matches and standard PUGs) work as before.
 
 ### v1.2
 
