@@ -557,7 +557,11 @@ def most_common_name(history, slot, fallback=None):
 def find_kills(netmsgs, deathmsg_id):
     """Scan all NetMsg payloads for variable-length user message <deathmsg_id>.
     Wire (variable-size user msg): byte id, byte length, then <length> bytes.
-    DeathMsg payload: byte killer, byte victim, byte headshot, str weapon+\\0.
+    DeathMsg payload (classic): byte killer, byte victim, byte headshot, str weapon+\\0.
+    Modded/newer servers append extra bytes after the weapon name (kill_id,
+    flags, etc). We accept these as long as a valid weapon name decodes at
+    the expected position — the trailing bytes are ignored, matching how
+    ColDemoPlayer treats these payloads.
     Returns list of (frame_time, killer, victim, headshot, weapon)."""
     if deathmsg_id is None:
         return []
@@ -569,17 +573,20 @@ def find_kills(netmsgs, deathmsg_id):
         while i < L - 5:
             if msg[i] == deathmsg_id:
                 length = msg[i + 1]
-                # killer(1)+victim(1)+hs(1)+weapon(>=1)+null(1) → length>=5,
-                # be slightly tolerant on the upper bound.
-                if 5 <= length <= 30 and i + 2 + length <= L:
+                # killer(1)+victim(1)+hs(1)+weapon(>=1)+null(1) → length>=5.
+                # Upper bound relaxed: modded servers append extra fields
+                # (kill_id, flags) after the weapon name, padding the payload.
+                if 5 <= length <= 50 and i + 2 + length <= L:
                     killer = msg[i + 2]
                     victim = msg[i + 3]
                     headshot = msg[i + 4]
                     payload_end = i + 2 + length  # exclusive
+                    # Find FIRST null after the weapon name starts. Classic
+                    # format ends here; modded payloads have trailing bytes we
+                    # don't care about.
                     weapon_end = msg.find(b"\x00", i + 5, payload_end)
                     if (
                         weapon_end > i + 5
-                        and weapon_end == payload_end - 1  # null is the last byte of payload
                         and 0 <= killer <= 32
                         and 1 <= victim <= 32
                         and headshot in (0, 1)
@@ -1401,12 +1408,14 @@ def _fmt_time(ftime):
 def format_kill(ftime, killer_name, victim_name, headshot, weapon):
     """Format a single kill line.
 
-    Headshot kills are wrapped in '*** ***' so that mouse-eye scanning the
-    CSV/TXT output picks them out quickly — feedback from movie-makers
-    confirmed this is genuinely useful even though it adds visual noise."""
+    Headshot kills are wrapped in '*** ***' so mouse-eye scanning picks them
+    out quickly — feedback from movie-makers confirmed this is genuinely
+    useful. The asterisks go AFTER the timestamp so that timestamps align
+    vertically across all lines regardless of HS status (matches
+    ColDemoPlayer output style)."""
     ts = _fmt_time(ftime)
     if headshot:
-        return f"*** {ts}: {killer_name} killed {victim_name} with a headshot from {weapon} ***"
+        return f"{ts}: *** {killer_name} killed {victim_name} with a headshot from {weapon} ***"
     return f"{ts}: {killer_name} killed {victim_name} with {weapon}"
 
 

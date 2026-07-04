@@ -4,7 +4,7 @@ Extract multikill highlights from Counter-Strike 1.6 demo files (`.dem`).
 Runs entirely on your computer — no Python installation, no internet required,
 no data ever leaves your machine.
 
-**Made by THUNDERGOD** · [v1.2](#version-history)
+**Made by THUNDERGOD** · [v1.3](#version-history)
 
 ---
 
@@ -283,6 +283,24 @@ If they're off by more than a second, please open an issue with the demo
 file attached (if sharing is OK) or at least the first 10 MB of it.
 
 ## Version history
+
+### v1.3
+
+**Bug fixes**
+- **Modded server DeathMsg payload support** — servers running ReHLDS /
+  ReGameDLL with certain AMX plugins append extra bytes (kill_id, flags,
+  etc.) after the weapon name in the DeathMsg payload. The strict
+  validation in v1.2 rejected these payloads entirely, causing zero
+  highlights on affected demos. Now the trailing bytes are ignored —
+  matching how ColDemoPlayer treats the same payloads. All modded-server
+  demos should now parse correctly alongside vanilla demos.
+
+**Formatting**
+- Headshot markers `***` moved from BEFORE the timestamp to AFTER, so
+  timestamps align vertically across all lines regardless of HS status.
+  Matches the ColDemoPlayer output style.
+  - Before: `*** 48:23: X killed Y with a headshot from usp ***`
+  - After:  `48:23: *** X killed Y with a headshot from usp ***`
 
 ### v1.2
 
