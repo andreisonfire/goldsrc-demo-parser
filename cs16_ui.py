@@ -34,7 +34,7 @@ MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB per request
 # string when shipping a new release; it appears in the browser tab title
 # and in the page header. We deliberately do NOT compute it from git tags
 # or anywhere else — keep one literal that's grep-able.
-VERSION = "1.3"
+VERSION = "1.2"
 
 
 # ---------------------------------------------------------------------------
