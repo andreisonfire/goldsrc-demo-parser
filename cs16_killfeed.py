@@ -208,8 +208,8 @@ def parse_demo_container(data: bytes):
 
 def collect_svc_time_samples(netmsgs):
     """Walk every NetMsg payload, pick out SVC_TIME (id=7) samples, and
-    return them as a list of (frame_ftime, server_time) tuples, sorted by
-    frame_ftime.
+    return them as a list of (frame_ftime, server_time) tuples in the
+    order they were seen.
 
     Important caveats:
       - Early in a demo the server often broadcasts SVC_TIME=0.000 during
@@ -218,6 +218,10 @@ def collect_svc_time_samples(netmsgs):
         are garbage (random 4 bytes interpreted as float). We keep them
         here but callers should use apply_server_time_to_events() which
         rolls a median to reject outliers.
+      - Some demos have very extreme false positives (float values in the
+        millions or billions of seconds). Those poison the downstream
+        median. Tight upper bound: no CS demo runs more than ~28h; the
+        rest is downstream's job.
 
     Wire format: 1 byte id (7) + 4 bytes little-endian float."""
     samples = []
@@ -232,17 +236,26 @@ def collect_svc_time_samples(netmsgs):
                 except struct.error:
                     i += 1
                     continue
-                # filter obvious signon zeros and absurd values
-                if 0.5 < t < 10_000_000.0:
+                # Filter obvious signon zeros and clearly absurd values.
+                # A CS 1.6 demo never runs more than a day; anything above
+                # 100 000 seconds is a random-bytes-as-float misfire.
+                if 0.5 < t < 100_000.0:
                     best = t
             i += 1
         if best is not None:
             samples.append((ftime, best))
+
+    # apply_server_time_to_events() bisects on the ftime column, so this list
+    # must actually be sorted by it. Netmsg order is normally already ftime
+    # order, but a signon preamble carrying the server's uptime breaks that
+    # (see the note in find_round_events) and an unsorted list makes bisect
+    # return nonsense neighbours, corrupting every timestamp on the demo.
+    samples.sort(key=lambda s: s[0])
     return samples
 
 
 def apply_server_time_to_events(events, svc_samples, get_ftime, set_ftime,
-                                window=21, max_dev=5.0):
+                                window=101, max_dev=5.0):
     """Translate event timestamps from demo-time to server-time using
     SVC_TIME samples.
 
@@ -256,6 +269,16 @@ def apply_server_time_to_events(events, svc_samples, get_ftime, set_ftime,
 
     This is robust — it tolerates up to ~40% garbage samples before the
     median tips over.
+
+    On the window size: it was 21, which fails when garbage samples arrive
+    in a CONTIGUOUS RUN rather than sprinkled randomly. A run of 11+ bad
+    samples wins the median outright and hands nearby events a timestamp
+    that's off by hours. Observed on a real demo (375_166_602952): ~22
+    consecutive junk samples around demo-time 534s pushed one round-end and
+    two kills to 180:20 / 721:18. At window=101 such a run can no longer
+    outvote its neighbours. The cost is a slightly coarser fit where the
+    offset drifts fast, which is harmless — the drift is far slower than a
+    round.
 
     events      — iterable of records
     svc_samples — output of collect_svc_time_samples (sorted by ftime)
@@ -481,17 +504,109 @@ def side_at_time(model_history, slot, query_time):
     return model_to_side(last_model)
 
 
-def is_teammate_kill(kill, model_history):
-    """True iff this kill is a team-kill (killer and victim on the same side
-    at the moment of the kill).
+MAX_GRAPH_PLAYERS = 16     # brute force is 2^(n-1); above this, fall back
+MIN_GRAPH_KILLS = 20       # fewer cross-kills than this and a split is guesswork
+MAX_GRAPH_INTRA = 0.25     # >25% of kills inside a team means no clean split
 
-    Conservative: only returns True when BOTH sides are known and equal.
-    If either is unknown, returns False so we don't drop legitimate kills
-    when team info is missing (some demos may have partial userinfo data).
+
+def infer_teams_from_kills(kills, slot_names):
+    """Work out which players are on the same team from who killed whom.
+
+    Why not use the `model` field: it's the only team signal CS 1.6 userinfo
+    gives us, and it goes stale. Some servers never resend a player's model
+    after a side switch, and one stale player poisons team detection in both
+    directions. On mtw-vs-no-dsrack3-playoffs, slot 9 (mTw | minet) kept the
+    model it was given at 01:30 until 63:39; for the whole second half the
+    filter therefore read him as CT while his team played T. That deleted 44
+    legitimate kills of his as "team-kills" — costing five real highlights,
+    three of them aces — while simultaneously letting three actual team-kills
+    through as a "fast 3hs" highlight.
+
+    Kill graph instead: in a real match essentially every kill crosses team
+    lines, so the correct split is the one leaving the FEWEST kills inside a
+    team. Teams also stay fixed for the whole demo while sides swap at half
+    time, so this needs no time tracking at all — which removes the entire
+    class of stale-userinfo bugs.
+
+    With ten players the search space is 2^9 = 512 splits, so an exact brute
+    force is cheaper than any heuristic. Measured over a 68-demo corpus: the
+    best split leaves a median of 1.8% of kills inside teams and never more
+    than 18.9%, and it agreed with clan-tag groupings on all 16 demos where
+    tags were legible, with zero contradictions.
+
+    Returns {slot_index: 0 or 1}, or None when the result shouldn't be
+    trusted — too many players to brute force, too few kills to constrain
+    the answer, or no split clean enough. Callers fall back to the model
+    field in that case.
+    """
+    import itertools
+    from collections import defaultdict
+
+    # Entities seen actually fighting. The HLTV proxy occupies a slot but
+    # never kills or dies, so it would be unconstrained noise in the split.
+    active = set()
+    for _t, killer, victim, _hs, _w in kills:
+        if killer and killer != victim:
+            active.add(killer)
+            active.add(victim)
+    active = {e for e in active
+              if "hltv" not in (slot_names.get(e - 1) or "").lower()}
+    if len(active) < 2 or len(active) > MAX_GRAPH_PLAYERS:
+        return None
+
+    weight = defaultdict(int)
+    for _t, killer, victim, _hs, _w in kills:
+        if killer == 0 or killer == victim:
+            continue
+        if killer not in active or victim not in active:
+            continue
+        weight[tuple(sorted((killer, victim)))] += 1
+    total = sum(weight.values())
+    if total < MIN_GRAPH_KILLS:
+        return None
+
+    # Anchor the first player so we enumerate each split once, not twice.
+    ordered = sorted(active)
+    anchor, rest = ordered[0], ordered[1:]
+    best_side, best_intra = None, None
+    for size in range(len(rest) + 1):
+        for combo in itertools.combinations(rest, size):
+            side = {anchor} | set(combo)
+            intra = sum(c for (a, b), c in weight.items()
+                        if (a in side) == (b in side))
+            if best_intra is None or intra < best_intra:
+                best_intra, best_side = intra, side
+
+    if best_side is None or best_intra / total > MAX_GRAPH_INTRA:
+        return None
+    # An all-in-one-group "split" explains nothing.
+    if len(best_side) == len(active) or not best_side:
+        return None
+    return {e - 1: (0 if e in best_side else 1) for e in active}
+
+
+def is_teammate_kill(kill, model_history, teams=None):
+    """True iff this kill is a team-kill (killer and victim on the same team).
+
+    Prefers `teams` from infer_teams_from_kills() when available, since the
+    model field is unreliable — see the note there. Falls back to comparing
+    models at the time of the kill.
+
+    Conservative in both modes: only returns True when BOTH sides are known
+    and equal. If either is unknown we return False rather than drop a kill
+    that might be legitimate.
     """
     ftime, killer_ent, victim_ent, _hs, _w = kill
     if killer_ent == 0 or killer_ent == victim_ent:
         return False
+
+    if teams is not None:
+        k_team = teams.get(killer_ent - 1)
+        v_team = teams.get(victim_ent - 1)
+        if k_team is not None and v_team is not None:
+            return k_team == v_team
+        # Player missing from the graph (never fought): fall through to models.
+
     # Entity index in kill tuples is 1-based; userinfo slot is 0-based
     k_side = side_at_time(model_history, killer_ent - 1, ftime)
     v_side = side_at_time(model_history, victim_ent - 1, ftime)
@@ -666,10 +781,19 @@ def find_kills(netmsgs, deathmsg_id):
 # ---------------------------------------------------------------------------
 def find_round_events(netmsgs):
     """Scan NetMsg payloads for round-related signals. Returns a sorted list
-    of (ftime, kind) tuples where kind is either 'round_end' or 'restart'.
+    of (ftime, kind, winner) tuples. `kind` is 'round_end' or 'restart';
+    `winner` is 'CT', 'T' or None (draws, restarts, unrecognised wins).
 
     Signals are plain ASCII strings embedded in SendAudio/TextMsg user
     messages — we match them by substring without full user-msg parsing.
+
+    Knowing the winning side matters because it's the only way to reconstruct
+    the score, and the score is the only way to know where regulation ends.
+    A CS 1.6 first half is always exactly 15 rounds, but the second half stops
+    the moment either team reaches 16, so its length varies from 1 to 15 and
+    cannot be assumed. Everything after that 16th round is post-match — often
+    one team standing at spawn while the other farms frags, which otherwise
+    shows up as a string of fake aces.
 
     Categories:
       - 'round_end' — a real round was won/lost/drawn:
@@ -680,34 +804,70 @@ def find_round_events(netmsgs):
       - 'restart' — the match was reset (warm-up end, false start,
         live restart, etc.):
             #Game_will_restart_in"""
-    round_end_signals = (
-        b"#CTs_Win", b"#Terrorists_Win", b"#Round_Draw",
-        b"#Target_Bombed", b"#Bomb_Defused", b"#Target_Saved",
-        b"#All_Hostages_Rescued", b"#Hostages_Not_Rescued",
-        b"%!MRAD_ctwin", b"%!MRAD_terwin", b"%!MRAD_rounddraw",
-        b"%!MRAD_bombdef",
+    # Which side each win message credits. Bomb detonating is a T win, defusing
+    # or the timer running out is a CT win.
+    ct_win_signals = (
+        b"#CTs_Win", b"#Bomb_Defused", b"#Target_Saved",
+        b"#All_Hostages_Rescued", b"%!MRAD_ctwin", b"%!MRAD_bombdef",
     )
+    t_win_signals = (
+        b"#Terrorists_Win", b"#Target_Bombed", b"#Hostages_Not_Rescued",
+        b"%!MRAD_terwin",
+    )
+    draw_signals = (b"#Round_Draw", b"%!MRAD_rounddraw")
     restart_signals = (
         b"#Game_will_restart_in",
     )
 
-    events = []
-    last_added = {"round_end": -10.0, "restart": -10.0}
+    # Collect every hit FIRST, then sort by time, and only then debounce.
+    #
+    # Debouncing during the scan assumes netmsgs arrive in increasing ftime
+    # order, and that assumption does not hold. A demo can open with a signon
+    # preamble whose frames carry the server's uptime rather than a recording
+    # offset — 25 to 138 such frames were seen in this corpus — after which the
+    # body restarts its clock near zero. Once a signal inside that preamble set
+    # last_added to the uptime value, "ftime - last_added > 2.0" is negative for
+    # every subsequent body frame and each one is rejected forever. On basi3.dem
+    # that silently discarded 26 of 28 round ends (93%), leaving 4 boundaries
+    # for a 34-minute match, collapsing every kill into two buckets of 18 and
+    # 14, and losing a real m4a1 ace to the >5 safety net.
+    #
+    # Sorting before the debounce makes the result independent of arrival order,
+    # and is a no-op on demos whose ftime is already monotonic (67 of 68 here).
+    hits = []
     for ftime, msg in netmsgs:
-        for sig in round_end_signals:
+        winner = None
+        matched = False
+        for sig in ct_win_signals:
             if sig in msg:
-                if ftime - last_added["round_end"] > 2.0:
-                    events.append((ftime, "round_end"))
-                    last_added["round_end"] = ftime
+                winner, matched = "CT", True
                 break
+        if not matched:
+            for sig in t_win_signals:
+                if sig in msg:
+                    winner, matched = "T", True
+                    break
+        if not matched:
+            for sig in draw_signals:
+                if sig in msg:
+                    matched = True
+                    break
+        if matched:
+            hits.append((ftime, "round_end", winner))
         for sig in restart_signals:
             if sig in msg:
-                if ftime - last_added["restart"] > 2.0:
-                    events.append((ftime, "restart"))
-                    last_added["restart"] = ftime
+                hits.append((ftime, "restart", None))
                 break
 
-    events.sort(key=lambda e: e[0])
+    hits.sort(key=lambda e: e[0])
+
+    events = []
+    last_added = {"round_end": -10.0, "restart": -10.0}
+    for ftime, kind, winner in hits:
+        if ftime - last_added[kind] > 2.0:
+            events.append((ftime, kind, winner))
+            last_added[kind] = ftime
+
     return events
 
 
@@ -716,12 +876,211 @@ def find_round_boundaries(netmsgs):
     events (both round-end and restart) as a flat sorted list.
 
     New code should prefer find_round_events() which preserves event types."""
-    return [t for t, _kind in find_round_events(netmsgs)]
+    return [e[0] for e in find_round_events(netmsgs)]
+
+
+PISTOL_ROUND_WEAPONS = {"glock18", "usp", "p228", "deagle", "elite",
+                        "fiveseven", "knife", "grenade", "hegrenade"}
+PISTOL_ROUND_FRAC = 0.75    # share of a round's kills that must be pistol-class
+REGULATION_HALF = 15        # a CS 1.6 first half is always exactly this
+MATCH_WIN_ROUNDS = 16       # first team to this many rounds wins regulation
+OVERTIME_HALF = 3           # rounds in an overtime half (the first one always)
+OVERTIME_WIN_ROUNDS = 4     # rounds needed to win a single overtime
+RESTART_BURST_GAP = 30.0    # restarts closer than this are one "LIVE" burst
+
+
+def _pistol_round_flags(kills, rounds, all_boundaries):
+    """For each round, whether its kills look like a pistol round.
+
+    Players start a half on $800, so the opening round is pistols, knife and
+    grenades only. Overtime halves start on $10000 and so never look like this.
+    Rounds with very few kills are excluded — an eco round mid-half can look
+    pistol-ish, and we only care about the opening round of a half, which is
+    always a full fight.
+
+    A round's kill window starts at the previous boundary of ANY kind, restarts
+    included, not merely at the previous round win. Rounds cut short by an
+    mp_restartround burst never produce a win message, so keying only on wins
+    stretches the window across them and lets their kills dilute the pistol
+    share. That is exactly what hid the second-half pistol round on
+    2433409_2433410, where a "LIVE, LIVE, LIVE" burst sits immediately before
+    it: the window swallowed the preceding warm-up rounds, the share fell under
+    the threshold, no second half was found, and filtering switched off.
+    """
+    bounds = sorted(all_boundaries)
+    flags = []
+    for t, _winner in rounds:
+        prev = 0.0
+        for b in bounds:
+            if b < t:
+                prev = b
+            else:
+                break
+        own = [k for k in kills
+               if prev < k[0] <= t and k[1] and k[1] != k[2]]
+        if len(own) < 4:
+            flags.append(False)
+        else:
+            pistol = sum(1 for k in own if k[4] in PISTOL_ROUND_WEAPONS)
+            flags.append(pistol / len(own) >= PISTOL_ROUND_FRAC)
+    return flags
+
+
+def find_live_intervals(kills, round_events):
+    """Work out which stretches of a demo are actual match play.
+
+    The problem this solves: warm-up before the match is already handled by
+    find_match_start(), but a demo also contains non-gameplay stretches in the
+    MIDDLE and at the END, and those look structurally identical to real
+    rounds — rounds start and end normally, victims are unique, teams and
+    models stay consistent. The usual shape is one team standing at spawn while
+    the other farms frags, which produces a run of fake aces. On
+    H2k_vs_Lions_DHW09 that was 14 of 22 highlights; on
+    mtw-vs-no-dsrack3-playoffs, 5 of 8.
+
+    They can't be spotted from the frags themselves, but CS 1.6 match rules
+    pin down where real play sits:
+
+      * Each half opens with a pistol round — $800 buys pistols only.
+      * The first half is ALWAYS exactly 15 rounds, whatever the score.
+      * Regulation ends when a team reaches 16 across both halves, so the
+        second half runs 1 to 15 rounds and its length must be derived.
+      * At 15:15 it goes to overtime: up to 3 rounds per half, opening on
+        $10000, so overtime halves are NOT pistol rounds.
+
+    Halves are located by the pistol rounds themselves rather than by
+    mp_restartround bursts. Restart detection is not dependable — on
+    mtw-vs-no-dsrack3-playoffs the half-time restart never reaches the stream,
+    so a restart-anchored search merged both halves into one 22-round period,
+    failed to find the second half at all, and discarded four live overtime
+    highlights. The pistol rounds are plainly visible in that demo (rounds 1
+    and 16), so they make the sturdier anchor. Restarts are still used to find
+    overtime halves, which have no pistol round to key off.
+
+    Returns a list of (start, end) ftime pairs covering live play, or None when
+    the structure isn't a standard match and filtering would be guesswork.
+    Callers then show everything, since demos cut mid-half are rare and losing
+    a real highlight is worse than letting some junk through.
+    """
+    rounds = sorted((e[0], e[2]) for e in round_events if e[1] == "round_end")
+    if len(rounds) < REGULATION_HALF:
+        return None
+
+    flags = _pistol_round_flags(kills, rounds,
+                                [e[0] for e in round_events])
+    pistols = [i for i, f in enumerate(flags) if f]
+    if len(pistols) < 2:
+        return None        # can't place both halves
+
+    # A pistol round opens a real half only if the next one is at least a full
+    # half away. Anything closer is a false start that got replayed.
+    half_starts = []
+    for n, i in enumerate(pistols):
+        nxt = pistols[n + 1] if n + 1 < len(pistols) else None
+        if nxt is None or nxt - i >= REGULATION_HALF:
+            half_starts.append(i)
+    if len(half_starts) < 2:
+        return None
+
+    h1, h2 = half_starts[0], half_starts[1]
+    if h1 + REGULATION_HALF > len(rounds):
+        return None
+
+    def _span(first_idx, last_idx):
+        lo = rounds[first_idx - 1][0] if first_idx > 0 else 0.0
+        return (lo, rounds[last_idx][0])
+
+    intervals = [_span(h1, h1 + REGULATION_HALF - 1)]
+
+    first = rounds[h1:h1 + REGULATION_HALF]
+    team_a = sum(1 for _t, w in first if w == "CT")
+    team_b = sum(1 for _t, w in first if w == "T")
+
+    # Sides swap at half time: whoever played CT now plays T.
+    second = rounds[h2:h2 + REGULATION_HALF]
+    if not second:
+        return None
+    last_idx = h2 + len(second) - 1
+    regulation_over = False
+    for offset, (t, winner) in enumerate(second):
+        if winner == "T":
+            team_a += 1
+        elif winner == "CT":
+            team_b += 1
+        if max(team_a, team_b) >= MATCH_WIN_ROUNDS:
+            last_idx = h2 + offset
+            regulation_over = True
+            break
+    intervals.append(_span(h2, last_idx))
+
+    # Playing all 15 out without a winner can only be 15:15 — the two halves
+    # award exactly 30 rounds between them.
+    tied = (not regulation_over
+            and len(second) == REGULATION_HALF
+            and team_a == team_b == MATCH_WIN_ROUNDS - 1)
+    if not tied:
+        return intervals
+
+    # Overtime halves have no pistol round to key off, so they're located by
+    # restart bursts instead.
+    restarts = sorted(e[0] for e in round_events if e[1] == "restart")
+    bursts = []
+    for t in restarts:
+        if not bursts or t - bursts[-1][-1] > RESTART_BURST_GAP:
+            bursts.append([t])
+        else:
+            bursts[-1].append(t)
+    after = rounds[last_idx][0]
+    ot_starts = [b[-1] for b in bursts if b[-1] > after]
+
+    # Overtimes come in pairs of halves and each pair is scored from zero:
+    # first to 4 rounds takes the match, 3:3 means another overtime. So the
+    # FIRST half of a pair is always all 3 rounds, while the second runs 1 to 3
+    # and stops the moment someone reaches 4 — 3:0 up needs only one more round.
+    # Everything after that winning round is post-match.
+    for pair in range(0, len(ot_starts), 2):
+        start_a = ot_starts[pair]
+        start_b = ot_starts[pair + 1] if pair + 1 < len(ot_starts) else None
+
+        def _rounds_from(lo, hi):
+            return [r for r in rounds
+                    if r[0] > lo and (hi is None or r[0] < hi)]
+
+        half_a = _rounds_from(start_a, start_b)[:OVERTIME_HALF]
+        if not half_a:
+            break
+        intervals.append((start_a, half_a[-1][0]))
+        ot_x = sum(1 for _t, w in half_a if w == "CT")
+        ot_y = sum(1 for _t, w in half_a if w == "T")
+
+        if start_b is None:
+            break
+        nxt = ot_starts[pair + 2] if pair + 2 < len(ot_starts) else None
+        half_b = _rounds_from(start_b, nxt)[:OVERTIME_HALF]
+        if not half_b:
+            break
+        decided = False
+        end_b = half_b[-1][0]
+        for t, winner in half_b:
+            # Sides swap between the two halves of an overtime, same as at
+            # half time in regulation.
+            if winner == "T":
+                ot_x += 1
+            elif winner == "CT":
+                ot_y += 1
+            if max(ot_x, ot_y) >= OVERTIME_WIN_ROUNDS:
+                end_b = t
+                decided = True
+                break
+        intervals.append((start_b, end_b))
+        if decided:
+            break        # match over; later periods are post-match
+
+    return intervals
 
 
 def find_match_start(round_events, min_rounds_in_half=15):
-    """Find the timestamp of the first match restart that is followed by
-    at least `min_rounds_in_half` round-ends without another restart.
+    """Find the timestamp of the restart that begins real gameplay.
 
     Why this matters: pro CS 1.6 demos often start with a long warm-up,
     then teams do an `mp_restartround` ("LIVE restart") to begin the match.
@@ -729,32 +1088,55 @@ def find_match_start(round_events, min_rounds_in_half=15):
     requests a redo, another LIVE restart happens — and so on. We don't
     want to count any of the false-start kills as highlights.
 
-    Logic: a CS 1.6 match half is exactly 15 rounds. The first restart
-    that is followed by 15 clean round-ends (no more restarts) is the
-    real match start. Everything before it is warm-up or false starts.
+    Primary rule: a CS 1.6 match half is exactly 15 rounds, so the first
+    restart followed by `min_rounds_in_half` clean round-ends (no restart
+    in between) is the real match start. Everything before it is warm-up
+    or false starts.
 
-    On overtime support: this function returns the *single* match-start
-    timestamp. We do NOT need to track side-switch restarts or OT
-    restarts separately because they always happen AFTER the first 15
-    rounds completed — so they sit safely after match_start in time.
-    Anything past match_start is real gameplay, including OT halves
-    that have only 3 round-ends per restart.
+    Fallback for short demos: plenty of demos are a single map, a fragment,
+    or a cut-down recording and simply never contain 15 rounds after any
+    restart — 15 of the 15 protocol-47 demos in the test corpus have
+    between 0 and 28 round-ends, most of them under 6. The strict rule
+    returned None for every one of them, which silently disabled warm-up
+    filtering altogether and let warm-up frags through as highlights. So
+    when nothing reaches the full-half threshold, fall back to the restart
+    with the LONGEST clean run of round-ends after it, which in a burst of
+    "LIVE, LIVE, LIVE" restarts is naturally the last one. At least two
+    clean rounds are required so we don't latch onto stray noise.
 
-    Returns the ftime of that restart, or None if no qualifying start
-    was found (e.g. casual demos with no restart at all)."""
-    for i, (ftime, kind) in enumerate(round_events):
+    On overtime: this returns the *single* match-start timestamp. Tracking
+    side-switch or OT restarts separately isn't necessary because they
+    always happen after the first half completed, so they sit safely after
+    match_start in time. Anything past match_start is real gameplay.
+
+    Returns the ftime of that restart, or None when there is no restart at
+    all (e.g. casual demos) or no restart with a usable run after it."""
+    # (clean round_ends after it, index, ftime) for every restart
+    runs = []
+    for i, (ftime, kind, _w) in enumerate(round_events):
         if kind != "restart":
             continue
-        # Count round_end events after this restart, stopping if another
-        # restart is encountered before we hit min_rounds_in_half.
         round_ends_after = 0
-        for ftime2, kind2 in round_events[i + 1:]:
+        for _ftime2, kind2, _w2 in round_events[i + 1:]:
             if kind2 == "restart":
-                break  # false start — try next restart
+                break  # false start — this restart's run ends here
             if kind2 == "round_end":
                 round_ends_after += 1
-                if round_ends_after >= min_rounds_in_half:
-                    return ftime
+        runs.append((round_ends_after, i, ftime))
+
+    if not runs:
+        return None
+
+    # Primary rule: earliest restart that completes a full half.
+    for round_ends_after, _i, ftime in runs:
+        if round_ends_after >= min_rounds_in_half:
+            return ftime
+
+    # Fallback: the restart with the longest clean run. Ties resolve to the
+    # earliest, which filters the least and so risks dropping nothing real.
+    best = max(runs, key=lambda r: (r[0], -r[1]))
+    if best[0] >= 2:
+        return best[2]
     return None
 
 
@@ -769,15 +1151,18 @@ def select_round_multikills(kills, min_count, round_boundaries=None, max_gap_sec
 
     if round_boundaries:
         import bisect
+        # Must be sorted — see the same note in select_highlights(). An
+        # unsorted list makes bisect return garbage round indices and glues
+        # separate rounds into one streak.
+        round_boundaries = sorted(round_boundaries)
         buckets = defaultdict(list)  # (round_idx, killer) -> [kills]
         for k in kills:
             ftime, killer, _v, _hs, _w = k
             if killer == 0:
                 continue
-            # bisect_left places kill at time == boundary[i] into round i
-            # i.e. the round that just ended — the correct bucket, since
-            # the game-ending frag is part of that round.
-            r = bisect.bisect_left(round_boundaries, ftime)
+            # See ROUND_EDGE_EPS: a frag landing just after the round_end
+            # message belongs to the round that just ended, not the next one.
+            r = bisect.bisect_left(round_boundaries, ftime - ROUND_EDGE_EPS)
             buckets[(r, killer)].append(k)
 
         streaks = []
@@ -851,6 +1236,31 @@ def select_multikills(kills, window_sec, min_count):
 # ---------------------------------------------------------------------------
 ONE_SHOT_WEAPONS = {"awp", "scout"}
 ONE_SHOT_WINDOW = 1.0   # seconds: kills closer than this count as a single one-shot multikill
+
+# How many seconds after a round_end signal a kill still belongs to the round
+# that just ended.
+#
+# The round-winning frag and the "#CTs_Win" / "#Bomb_Defused" message reach the
+# demo stream at practically the same instant, and which lands first is a coin
+# flip. When the DeathMsg loses that race the kill gets bucketed into the NEXT
+# round, which breaks the multikill it belonged to and glues a stray frag onto
+# the following round. Observed on 1161_2636 (MYM Jumpwhy): a clean 4k was
+# reported as a 5-kill "ace" spanning 64.9s.
+#
+# It also covers the legitimate case of frags landing after the round is
+# formally decided — defusing the bomb and then killing the last terrorist, or
+# the clock running out and the T killing the last CT. Those are part of the
+# same firefight and belong to the round that just ended.
+#
+# Measured over a 68-demo corpus: the gap between a round_end and the next kill
+# is strongly bimodal. Post-round frags land at 0.01 / 0.40 / 0.82 / 2.93 /
+# 4.76 / 4.86s, while the first kill of the genuinely next round never arrives
+# sooner than 14.56s — the round-end delay plus freeze time make it impossible.
+# The 5-12s band is completely empty, so 6.0 sits in the middle of that gap: it
+# catches every observed post-round frag and stays far below the first value
+# that could swallow a real next-round kill. Output is identical anywhere in
+# 2-15s; the corpus only starts changing at 20s.
+ROUND_EDGE_EPS = 6.0
 HS_COMBO_WEAPONS = {"deagle", "ak47", "m4a1"}
 HS_COMBO_WINDOW = 5.0   # seconds: 3 HS within this window with combo weapons is "fast 3hs"
 
@@ -1025,6 +1435,21 @@ def select_highlights(kills, round_boundaries):
     from collections import defaultdict
     import bisect
 
+    # bisect requires a SORTED list — on an unsorted one it silently returns
+    # nonsense indices, which collapses kills from many different rounds into
+    # a single bucket and produces impossible "11-kill aces".
+    #
+    # The list can arrive unsorted even though round events are found in
+    # demo-time order: apply_server_time_to_events translates each event with
+    # a locally-estimated offset, and a cluster of garbage SVC_TIME samples
+    # can hand one event a wildly wrong timestamp. One bad entry is enough to
+    # break the ordering, and bisect then mis-buckets everything after it.
+    #
+    # Sorting here is the safety net that makes the mis-bucketing impossible
+    # regardless of how noisy the timestamps are.
+    if round_boundaries:
+        round_boundaries = sorted(round_boundaries)
+
     buckets = defaultdict(list)
     for k in kills:
         ftime, killer, victim, _hs, _w = k
@@ -1032,7 +1457,12 @@ def select_highlights(kills, round_boundaries):
             continue
         if killer == victim:              # self-kill (falldamage, own nade, etc)
             continue
-        r = bisect.bisect_left(round_boundaries, ftime) if round_boundaries else 0
+        # ROUND_EDGE_EPS pulls a kill back by a few seconds before choosing its
+        # round, so a frag that landed just after the round_end message stays
+        # with the round it actually belonged to. Only the bucket choice is
+        # shifted — the kill keeps its real timestamp everywhere else.
+        r = (bisect.bisect_left(round_boundaries, ftime - ROUND_EDGE_EPS)
+             if round_boundaries else 0)
         buckets[(r, killer)].append(k)
 
     highlights = []
@@ -1192,7 +1622,7 @@ def parse_demo_full(demo_path):
     model_history = find_model_history(netmsgs)
     kills = find_kills(netmsgs, deathmsg_id)
     round_events = find_round_events(netmsgs)
-    boundaries = [t for t, _ in round_events]
+    boundaries = [e[0] for e in round_events]
 
     # Server-time correction: sample every SVC_TIME in the demo, then for
     # each kill/boundary look up the nearest sample to compute its real
@@ -1214,7 +1644,7 @@ def parse_demo_full(demo_path):
     round_events_st = apply_server_time_to_events(
         round_events, svc_samples,
         get_ftime=lambda e: e[0],
-        set_ftime=lambda e, t: (t, e[1]),
+        set_ftime=lambda e, t: (t, e[1], e[2]),
     )
     # Apply server-time to the name history entries too — so a lookup with
     # a kill's server time will hit the right name change.
@@ -1247,7 +1677,15 @@ def parse_demo_full(demo_path):
     # bucket — 4 enemies + 1 teammate killed should read as a quad, not an
     # ace. Conservative: if either side is unknown for a kill, we keep it
     # (don't drop legitimate highlights when model data is partial).
-    kills = [k for k in kills if not is_teammate_kill(k, model_history_st)]
+    #
+    # Teams come from the kill graph when it can produce a confident split,
+    # because the model field goes stale on some servers and one stale player
+    # breaks the filter in both directions. See infer_teams_from_kills().
+    # It reads only the killer/victim columns, so it's indifferent to whether
+    # these kills carry server-corrected or raw timestamps.
+    teams = infer_teams_from_kills(kills, slot_names)
+    kills = [k for k in kills
+             if not is_teammate_kill(k, model_history_st, teams=teams)]
 
     # Also report a robust offset estimate for diagnostics/UI display.
     # Use a median across early samples — the very first sample is often
@@ -1282,7 +1720,28 @@ def parse_demo_full(demo_path):
     #    would mistake the side-switch restart for the match start and drop
     #    the ace. Skipping the filter for POV avoids that loss.
     match_start = find_match_start(round_events_st, min_rounds_in_half=15)
-    if demo_type == "HLTV" and match_start is not None:
+    live_intervals = None
+    if demo_type == "HLTV":
+        # Prefer full match-structure detection: it also excludes the pause
+        # between halves and everything after regulation ends, which
+        # match_start alone can't see. Returns None when the demo isn't a
+        # standard match, in which case we fall back to match_start.
+        #
+        # POV demos are deliberately excluded — a POV recording can begin at
+        # any round, so its structure is unreliable and we show everything.
+        live_intervals = find_live_intervals(kills, round_events_st)
+
+    if live_intervals:
+        def _is_live(t):
+            # Each interval ends on a round_end signal, and the frag that WON
+            # that round can land a fraction of a second after it (same race
+            # ROUND_EDGE_EPS exists for). Without this tolerance the
+            # round-winning kill falls outside and a 4k reads as a triple.
+            return any(lo <= t <= hi + ROUND_EDGE_EPS
+                       for lo, hi in live_intervals)
+        kills_for_highlights = [k for k in kills if _is_live(k[0])]
+        boundaries_for_highlights = [b for b in boundaries if _is_live(b)]
+    elif demo_type == "HLTV" and match_start is not None:
         kills_for_highlights = [k for k in kills if k[0] >= match_start]
         boundaries_for_highlights = [b for b in boundaries if b >= match_start]
     else:
@@ -1417,6 +1876,12 @@ def build_csv_rows(parsed):
     Killer name uses the time of the FIRST kill in the streak (stable for
     the whole streak so the output reads naturally). Victim names use the
     time of EACH kill individually.
+
+    Multikills of 6+ kills are dropped here — CS 1.6 teams are 5 vs 5, so
+    an in-round streak can never exceed 5 (ace). Anything above that is
+    guaranteed to be two rounds glued together by a missed round boundary,
+    which is nonsense to show as a single highlight. The underlying parser
+    data is left untouched for debugging / future round-splitting logic.
     """
     rows = []
     slot_names = parsed["slot_names"]
@@ -1424,6 +1889,10 @@ def build_csv_rows(parsed):
 
     for streak in parsed["highlights"]:
         kills = streak['kills']
+        if len(kills) > 5:
+            # Impossible-in-one-round — hide until we implement proper
+            # round-boundary splitting. See v2.1 backlog.
+            continue
         killer_idx = kills[0][1]
         # Killer name: use time of FIRST kill in streak for consistency
         killer_name = name_at_time(

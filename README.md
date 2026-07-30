@@ -4,7 +4,7 @@ Extract multikill highlights from Counter-Strike 1.6 demo files (`.dem`).
 Runs entirely on your computer — no Python installation, no internet required,
 no data ever leaves your machine.
 
-**Made by THUNDERGOD** · [v1.3](#version-history)
+**Made by THUNDERGOD** · [v2.0](#version-history)
 
 ---
 
@@ -44,31 +44,31 @@ movie making, clip compilation, or just reviewing.
 
 1. Download the latest release zip (see **Releases** tab).
 2. Unzip anywhere.
-3. Double-click `run_ui.bat`.
-4. A browser tab opens at `http://localhost:8765` — drop your `.dem` files there.
-5. Hit **Download CSV**.
+3. Double-click `gsdp.exe` (or `run_ui.bat`).
+4. A native app window opens — drop your `.dem` files onto the drop zone.
+5. Hit **Export** and pick CSV or TXT.
 
-No Python, no dependencies, no setup.
+No Python, no dependencies, no setup. Works on Windows 10 / 11 out of the
+box — the app uses the system's built-in WebView2 runtime.
 
 ## How to use
 
-### Web UI (recommended)
+### Desktop app (recommended)
 
-Double-click `run_ui.bat`. A browser opens with a drag-and-drop zone.
+Double-click `gsdp.exe`. A native app window opens with a drag-and-drop zone.
 
 - **Drop one or more `.dem` files** onto the area (or click to pick them).
 - Each demo is processed locally (may take 2–10 seconds for a 20 MB file).
 - Results show up in a table grouped by highlight.
-- Click **Download CSV** when done.
+- Star the rows you want to keep, then hit **Export** and pick CSV or TXT.
+  Tick **favourites only** to export just the starred rows.
+- After saving, your file manager opens with the exported file selected.
 - Click **Clear** to reset and start over.
 
-> `run_ui.bat` is just a convenience wrapper around `cs16_ui.exe` — you can
-> launch the `.exe` directly if you prefer. The batch file opens a small
-> console window alongside the browser; the `.exe` does the same.
+> `run_ui.bat` is a wrapper around `gsdp.exe`. Either works.
 
-> **Windows Firewall prompt** on first run is normal — the tool opens a local
-> web server for the browser UI. No external connections are made. Choose
-> "Allow access on private network" and you won't see it again.
+> Everything runs locally on your machine. No internet connection, no
+> firewall prompts, no data leaves the app.
 
 ### Drag-and-drop batch files (alternative)
 
@@ -199,7 +199,7 @@ build_exe.bat
 
 The script:
 1. Installs PyInstaller via pip
-2. Builds `cs16_killfeed.exe` (CLI) and `cs16_ui.exe` (web UI)
+2. Builds `cs16_killfeed.exe` (CLI) and `gsdp.exe` (desktop app)
 3. Collects everything into a `release/` folder ready to zip and distribute
 
 No external Python dependencies — only the standard library is used.
@@ -263,6 +263,23 @@ See [HLTV vs POV detection](#hltv-vs-pov-detection) above.
   Future versions may expose them as UI options.
 - **Single-threaded** — processes demos one at a time. A 5-minute matchday
   batch of 10 demos takes ~1 minute total.
+- **Non-competitive stretches inside a live demo are not detected.** Technical
+  pauses, or one team standing at spawn while the other shoots them, look
+  structurally identical to real gameplay: rounds start and end normally,
+  victims are unique, teams and models are consistent. On
+  `mtw-vs-no-dsrack3-playoffs` this produces about four highlights nobody wants.
+  Warm-up *before* the match is filtered, but a pause can begin at any point.
+- **Team detection can misplace a barely-active player in a very short demo.**
+  Teams come from the kill graph, which anchors each player through both the
+  kills they made and the deaths they took. A player who frags almost never
+  during the match but team-kills repeatedly in a warm-up can be pulled to the
+  wrong side, because the flip only costs less than his few real kills and
+  deaths. Measured threshold: this needs team-kills to outnumber his deaths
+  plus kills, which cannot happen across a full match (a player dies ~25 times
+  in 30 rounds) but is reachable in a 3-5 round fragment. Across the 68-demo
+  test corpus no player was actually misplaced. Fix planned: score each
+  player's placement confidence and fall back to the model field for the
+  weakly-anchored ones.
 
 ## Troubleshooting
 
@@ -274,15 +291,174 @@ session. Full-match demos should always parse fine.
 **"Not a GoldSrc demo file (bad magic)"**
 The file isn't a valid `.dem`, or it's from a different engine (e.g., CS:GO).
 
-**Console window stays open after closing the browser**
-Yes, known UX issue — the local web server keeps running. Close the console
-window manually (the `X` in its corner) or press `Ctrl+C` inside it.
-
 **Timestamps don't match the in-game player**
 If they're off by more than a second, please open an issue with the demo
 file attached (if sharing is OK) or at least the first 10 MB of it.
 
 ## Version history
+
+### v2.0
+
+**Round-bucketing fixes**
+
+Three separate defects made kills land in the wrong round. Each was found by
+running the parser against a 68-demo corpus and comparing against ColDemoPlayer.
+
+- **Boundaries are now sorted before `bisect`.** `bisect` silently returns
+  nonsense indices on an unsorted list, which collapsed kills from several
+  rounds into one bucket. On `375_166_602952` a single round-end that had been
+  handed a corrupt timestamp broke the ordering and produced buckets of 11, 9
+  and 6 kills — all three were then swallowed by the `>5` safety net, so the
+  demo reported 2 highlights instead of 5. The 3 lost ones included a genuine
+  6.9-second m4a1 ace.
+- **A frag landing just after the round-end message stays in its own round**
+  (`ROUND_EDGE_EPS`, 6 seconds). The round-winning DeathMsg and the
+  `#CTs_Win` / `#Bomb_Defused` message race each other in the stream, and when
+  the kill lost it was bucketed into the next round. This also covers frags
+  that are legitimately post-round: defusing and then killing the last
+  terrorist, or the clock expiring and the T killing the last CT.
+- **Round-event debounce no longer depends on arrival order.** Hits are
+  collected, sorted, then collapsed. A demo can open with a signon preamble
+  whose frames carry the server's uptime instead of a recording offset; a
+  round-end inside that preamble used to poison the debounce state and reject
+  every later event. On `basi3.dem` that discarded 26 of 28 round ends, left 4
+  boundaries for a 34-minute match, and lost a real m4a1 ace.
+
+`collect_svc_time_samples()` now sorts its output by frame time, which
+`apply_server_time_to_events()` bisects on. The rolling-median window for
+server-time correction widened from 21 to 101 samples so that a contiguous run
+of garbage samples can no longer outvote its neighbours.
+
+Net effect across 68 demos: 6 changed, 62 byte-for-byte identical. Of the 6,
+three recovered real highlights, one removed a false 4k that was two rounds
+glued together, one corrected a false ace down to the 4k it actually was, and
+one shifted a single timestamp by a second.
+
+**Team detection from the kill graph**
+
+Team-kills have to be excluded before highlights are counted — 4 enemies plus
+a teammate is a quad, not an ace. The only team signal CS 1.6 userinfo offers
+is the `model` field, and it goes stale: some servers never resend a player's
+model after a side switch, and a single stale player breaks the filter in both
+directions at once.
+
+On `mtw-vs-no-dsrack3-playoffs` slot 9 kept the model it was assigned at 01:30
+until 63:39, so for the entire second half the filter read him as CT while his
+team played T. That deleted 44 of his legitimate kills as "team-kills", costing
+five real highlights including three aces, while simultaneously passing three
+actual team-kills through as a "fast 3hs with ak" highlight.
+
+Teams are now inferred from who killed whom. In a real match essentially every
+kill crosses team lines, so the correct split is the one leaving the fewest
+kills inside a team. With ten players that's 512 possible splits, so an exact
+brute force is cheaper than any heuristic. Teams also stay fixed for the whole
+demo while sides swap at half time, so this needs no time tracking — removing
+the entire class of stale-userinfo bugs.
+
+Measured over a 68-demo corpus: the best split leaves a median of 1.8% of kills
+inside teams and never more than 18.9%, and it matched clan-tag groupings on all
+16 demos where tags were legible, with no contradictions. Six recovered
+highlights were confirmed by hand against the game. The model field is still
+used as a fallback whenever the graph can't produce a confident split — too
+many players to brute force, too few kills to constrain the answer, or no split
+clean enough.
+
+**Non-gameplay stretches inside a live demo**
+
+Warm-up before the match was already filtered, but a demo also contains
+non-gameplay stretches in the MIDDLE and at the END, and those look
+structurally identical to real rounds — rounds start and end normally, victims
+are unique, teams and models stay consistent. The usual shape is one team
+standing at spawn while the other farms frags, which reads as a run of aces.
+On H2k_vs_Lions_DHW09 that was 14 of 22 highlights; on
+mtw-vs-no-dsrack3-playoffs, 5 of 8.
+
+They can't be told apart from the frags themselves, but CS 1.6 match rules pin
+down where real play sits, so `find_live_intervals()` reconstructs the match
+structure instead:
+
+- Each half opens with a pistol round, since $800 only buys pistols. Halves are
+  located by those pistol rounds rather than by `mp_restartround` bursts —
+  restart detection isn't dependable, and on mtw-vs-no the half-time restart
+  never reaches the stream at all, which merged both halves into one 22-round
+  period and lost four live overtime highlights. The pistol rounds are plainly
+  visible there (rounds 1 and 16).
+- The first half is always exactly 15 rounds. A pistol round that has another
+  one within 15 rounds is a false start that got replayed.
+- Regulation ends when a team reaches 16, so the second half runs 1 to 15
+  rounds; its length comes from the score, which is why `find_round_events()`
+  now reports the winning side of every round.
+- At 15:15 it goes to overtime — up to 3 rounds per half, opening on $10000, so
+  overtime halves have no pistol round and are found via restart bursts.
+
+When the structure isn't a standard match the function returns None and nothing
+is filtered: fewer than two pistol rounds (one side wasn't recorded), too few
+rounds, or no locatable second half. Demos cut mid-half are rare and losing a
+real highlight is worse than letting some junk through.
+
+A round's pistol share is measured between the previous boundary of ANY kind,
+restarts included, and the round's own end. Rounds cut short by a restart burst
+never produce a win message, so keying only on wins stretches the window across
+them and their kills dilute the share — that hid the second-half pistol round on
+2433409_2433410, where a "LIVE, LIVE, LIVE" burst sits right before it.
+
+Note that round numbering here counts only WON rounds, so it won't line up with
+a demo viewer's. ColDemoPlayer numbers every round that started: on
+H2k_vs_Lions_DHW09 it lists 64 rounds against 41 wins, the other 23 having been
+cut short by restarts and replayed. Since a replayed round doesn't score, a half
+is always exactly 15 won rounds either way, which is what the 15-round rule
+relies on.
+
+Verified against the game by hand, demo by demo: of the highlights this removes
+across the corpus, 23 were confirmed junk and 7 were live — all 7 traced to bugs
+in the rules above, which were then fixed. Scores reconstructed from the win
+messages match the viewer exactly (H2k_vs_Lions 12:3 at half time then 15:15;
+zenn 11:4 then 16:7; 2433409 9:6 then 16:14).
+
+One known gap remains: a tournament that plays out all 30 rounds instead of
+stopping at 16 loses the highlights after the 16th round — seen once, on
+47_52_1100865.
+
+Pairing the two halves is safe because a demo only ever holds one map — a map
+change stops the recording, so a file can't contain two matches whose pistol
+rounds might be mismatched. Within one match the second half's pistol round is
+always at least 15 won rounds after the first's, so a closer pair is a false
+start and nothing else.
+
+**Warm-up filtering on short demos**
+
+`find_match_start()` looked for the first restart followed by 15 clean rounds,
+since a CS 1.6 half is exactly 15 rounds. Plenty of demos are a single map or a
+cut-down fragment and never contain 15 rounds after any restart — all 15
+protocol-47 demos in the test corpus fell short, most with under 6 rounds. The
+strict rule returned None for every one of them, which silently disabled warm-up
+filtering and let warm-up frags through as highlights.
+
+When nothing reaches a full half, it now falls back to the restart with the
+longest clean run of rounds after it — naturally the last of a "LIVE, LIVE,
+LIVE" burst. At least two clean rounds are required so stray noise can't
+qualify.
+
+**Native desktop app**
+- The tool no longer opens a browser tab. Instead, `gsdp.exe` launches
+  a native app window powered by [pywebview](https://pywebview.flowrl.com/)
+  and the system's WebView2 runtime (present on all Windows 10 / 11
+  machines by default). No more `http://localhost:8765`, no more console
+  window in the background, no more Firewall prompt on first run.
+- File picking and export go through native OS dialogs. Demos are read from
+  disk by path rather than shipped through the UI as base64, which keeps
+  memory flat on large batches.
+- After an export is saved, the file manager opens with the file selected.
+- The executable is now named `gsdp.exe` (was `cs16_ui.exe`). `run_ui.bat`
+  accepts either name, so existing release folders keep working.
+- Every highlight-selection rule is unchanged from v1.3 apart from the
+  round-bucketing fixes above.
+- `.exe` grew from ~9 MB to ~15–20 MB due to bundled pywebview components.
+
+**Icon**
+- Custom app icon replaces the default PyInstaller feather. White tactical
+  operator silhouette on black — shows up in Windows Explorer, on the
+  taskbar, in Alt+Tab, and in the app window's title bar.
 
 ### v1.3
 
