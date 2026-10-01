@@ -297,6 +297,71 @@ file attached (if sharing is OK) or at least the first 10 MB of it.
 
 ## Version history
 
+### v2.1
+
+**Filter panel**
+
+A panel above the results table, shown once something has been parsed.
+
+- Five category checkboxes: ace, 4k, triple, double, fast 3hs. A streak is kept
+  when any of its categories is ticked, and a streak carries every category it
+  contains rather than just its headline one — so an ace holding a one-shot
+  triple surfaces under "triple" as well. Ticking a single box narrows a corpus
+  run hard: across the 72-demo test set, "ace" alone leaves 16 of 159 rows and
+  "double" leaves 4.
+- A server-time / demo-time switch. Server time is the default and is what the
+  parser has always printed; demo time counts from the start of the recording
+  and matches what a demo player shows. Both are carried on every row, so the
+  switch is instant and needs no re-parse — and no offset estimate either,
+  which matters because the offset is unreliable on demos with noisy svc_time
+  samples.
+- Export follows the panel: whatever the table has been narrowed to is what
+  lands in the CSV or TXT, on the selected clock. The "favourites only" option
+  counts stars among visible rows only, so a star hidden behind a filter can't
+  keep it alive.
+
+Filtering happens in the UI over already-parsed rows, so toggling a box never
+re-reads a demo — on a hundred-demo batch a re-parse would cost minutes.
+Highlight selection itself is unchanged by the panel: the same 72 demos still
+produce the same 159 highlights.
+
+**Pistol-round detection**
+
+Halves are found by their pistol rounds, and two things were letting the wrong
+round through.
+
+- The kill floor was 4, which is low enough that a listless warm-up round with
+  four frags — three of them pistols by chance — passed the weapon-share test.
+  On `McPoker_eml_vs_Competo_KODE5DE` the teams couldn't start for an hour and
+  two such rounds were taken for half starts; the live window landed on warm-up
+  and all three reported highlights came from it. A real pistol round is a full
+  ten-man fight worth seven to nine frags, so the floor is now 6.
+- An eco round mid-half can read as pistol-heavy too — one scored 83% on
+  `2008-08-25_18h33_Emulate_dignitas`. Sitting only 8 rounds after the real
+  opening pistol round, it made the rule below mistake the REAL first half for
+  a false start: the window jumped forward 12 minutes, a genuine 4k in round 10
+  was dropped and a warm-up awp streak shown instead. Half starts now require an
+  mp_restartround burst shortly before them, since every half opens with one and
+  an eco round doesn't. That requirement is skipped when it would leave fewer
+  than two candidates, because restart detection isn't guaranteed — on
+  `mtw-vs-no-dsrack3-playoffs` the half-time restart never reaches the stream.
+
+**Overtime scoring**
+
+Overtime halves come in pairs scored from zero, first to 4 rounds takes the
+match, and 3:3 means another overtime. The first half of a pair is always all 3
+rounds while the second runs 1 to 3 — being 3:0 up needs only one more round. So
+a pair is now scored as a unit and everything after the winning round is treated
+as post-match. Previously every overtime half was simply capped at 3 rounds with
+no notion of the match having been decided.
+
+Net effect across the corpus: 3 demos changed against v2.0, all of them junk
+being removed — 5 highlights from a non-competitive stretch on
+`mtw-vs-no-dsrack3-playoffs`, 2 post-match aces on `zenn`, a between-halves
+highlight and a post-match one on `2433409_2433410`. One live highlight came
+back on `47_52_1100865`, which v2.0 had lost. Across the 72-demo corpus that
+leaves 159 highlights, with the >5 safety net firing on none of them.
+
 ### v2.0
 
 **Round-bucketing fixes**
@@ -414,10 +479,6 @@ across the corpus, 23 were confirmed junk and 7 were live — all 7 traced to bu
 in the rules above, which were then fixed. Scores reconstructed from the win
 messages match the viewer exactly (H2k_vs_Lions 12:3 at half time then 15:15;
 zenn 11:4 then 16:7; 2433409 9:6 then 16:14).
-
-One known gap remains: a tournament that plays out all 30 rounds instead of
-stopping at 16 loses the highlights after the 16th round — seen once, on
-47_52_1100865.
 
 Pairing the two halves is safe because a demo only ever holds one map — a map
 change stops the recording, so a file can't contain two matches whose pistol

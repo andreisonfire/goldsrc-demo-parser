@@ -8,7 +8,7 @@ formatted exactly like the user-provided template.
 
 Everything runs locally. No data ever leaves your machine.
 
-v2.0 rendered inside a native Windows window via pywebview (uses the
+v2.1 rendered inside a native Windows window via pywebview (uses the
 system's WebView2 runtime). The UI, the parser, and all selection rules
 are identical to v1.3 — only the delivery mechanism changed.
 """
@@ -35,7 +35,7 @@ MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB per file — matches v1.3 HTTP li
 # string when shipping a new release; it appears in the window title bar
 # and in the page header. We deliberately do NOT compute it from git tags
 # or anywhere else — keep one literal that's grep-able.
-VERSION = "2.0"
+VERSION = "2.1"
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +237,22 @@ INDEX_HTML = r"""<!doctype html>
 </head>
 <body>
 <main>
+  <style>
+    /* Filter panel: category checkboxes + the server/demo clock switch. */
+    .filters { display:none; gap:18px; align-items:flex-start; flex-wrap:wrap;
+               margin:14px 0 4px; padding:12px 14px; border:1px solid #2a3142;
+               border-radius:8px; background:#161b26; }
+    .filters.visible { display:flex; }
+    .filter-group { display:flex; flex-direction:column; gap:6px; }
+    .filter-group > .filter-title { font-size:11px; letter-spacing:.08em;
+               text-transform:uppercase; color:#7a8699; margin-bottom:2px; }
+    .filter-opts { display:flex; gap:14px; flex-wrap:wrap; }
+    .filter-opts label { display:flex; align-items:center; gap:5px;
+               font-size:13px; color:#c6cede; cursor:pointer; user-select:none; }
+    .filter-opts input { cursor:pointer; }
+    .filter-count { margin-left:auto; align-self:center; font-size:12px;
+               color:#7a8699; }
+  </style>
   <h1>GoldSrc Demo Parser <span class="version-tag">v__VERSION__</span> <span class="badge">by THUNDERGOD</span></h1>
   <div class="sub">Drop .dem files below &mdash; output CSV matches your template.
     Everything runs on your PC. No uploads anywhere.</div>
@@ -273,7 +289,27 @@ INDEX_HTML = r"""<!doctype html>
 
   <div class="log" id="log" style="display:none"></div>
 
-  <div id="results"></div>
+  <div class="filters" id="filters">
+  <div class="filter-group">
+    <span class="filter-title">Highlight types</span>
+    <div class="filter-opts" id="typeFilters">
+      <label><input type="checkbox" data-type="ace" checked> ace</label>
+      <label><input type="checkbox" data-type="4k" checked> 4k</label>
+      <label><input type="checkbox" data-type="triple" checked> triple</label>
+      <label><input type="checkbox" data-type="double" checked> double</label>
+      <label><input type="checkbox" data-type="fast_3hs" checked> fast 3hs</label>
+    </div>
+  </div>
+  <div class="filter-group">
+    <span class="filter-title">Timestamps</span>
+    <div class="filter-opts" id="timeFilters">
+      <label><input type="radio" name="timebase" value="server" checked> server time</label>
+      <label><input type="radio" name="timebase" value="demo"> demo time</label>
+    </div>
+  </div>
+  <span class="filter-count" id="filterCount"></span>
+</div>
+<div id="results"></div>
 </main>
 
 <script>
@@ -300,7 +336,44 @@ function logLine(text, cls) {
 // survive table re-renders. Row indexes alone don't work because
 // re-rendering builds new DOM nodes.
 let nextRowId = 0;
+const filtersEl = document.getElementById('filters');
+const filterCountEl = document.getElementById('filterCount');
 const rowMeta = new Map();        // id -> { row: array, favorite: bool }
+
+// Filter state. Rows are parsed once and filtered here, so toggling a box
+// never re-reads a demo — on a 100-demo batch a re-parse would take minutes.
+const activeTypes = new Set(['ace', '4k', 'triple', 'double', 'fast_3hs']);
+let timeBase = 'server';
+
+// Row layout from build_csv_rows():
+//   0 demo_name, 1 map, 2 player_name, 3 highlight (server clock),
+//   4 info, 5 highlight (demo clock), 6 types
+const COL_HIGHLIGHT_SERVER = 3;
+const COL_HIGHLIGHT_DEMO = 5;
+const COL_TYPES = 6;
+
+// The highlight text to show, per the clock the user picked. Older parses
+// without the demo column fall back to the server one.
+function highlightText(r) {
+  if (timeBase === 'demo' && r[COL_HIGHLIGHT_DEMO]) return r[COL_HIGHLIGHT_DEMO];
+  return r[COL_HIGHLIGHT_SERVER];
+}
+
+// A row survives if ANY of its categories is ticked. A streak carries every
+// category it contains, so an ace holding a one-shot triple matches "triple"
+// too — ticking triple alone still surfaces it, as intended.
+function rowPassesFilter(r) {
+  const types = r[COL_TYPES];
+  if (!Array.isArray(types) || types.length === 0) return true;
+  return types.some(t => activeTypes.has(t));
+}
+
+function visibleIds() {
+  return orderedIds.filter(id => {
+    const meta = rowMeta.get(id);
+    return meta && rowPassesFilter(meta.row);
+  });
+}
 const orderedIds = [];            // insertion order, drives table rendering
 
 function addRows(newRows) {
@@ -317,15 +390,20 @@ function clearAllRows() {
   // keep nextRowId increasing so old DOM listeners (if any) can't collide
 }
 
+// Counts only rows currently visible: a star hidden behind a filter shouldn't
+// keep the "favourites only" export option alive.
 function favoritesCount() {
   let n = 0;
-  for (const id of orderedIds) {
+  for (const id of visibleIds()) {
     if (rowMeta.get(id).favorite) n++;
   }
   return n;
 }
 
 function renderTable() {
+  // The panel only makes sense once something has been parsed.
+  filtersEl.classList.toggle('visible', orderedIds.length > 0);
+
   if (orderedIds.length === 0) {
     results.innerHTML = '<div class="empty">No highlights yet.</div>';
     clearBtn.disabled = true;
@@ -335,6 +413,23 @@ function renderTable() {
     return;
   }
   clearBtn.disabled = false;
+
+  const shown = visibleIds();
+  filterCountEl.textContent =
+    shown.length === orderedIds.length
+      ? `${orderedIds.length} highlight${orderedIds.length === 1 ? '' : 's'}`
+      : `${shown.length} of ${orderedIds.length} shown`;
+
+  // Nothing left after filtering isn't an error — say so and leave the panel
+  // up so the user can widen the selection again.
+  if (shown.length === 0) {
+    results.innerHTML =
+      '<div class="empty">No highlights match the selected types.</div>';
+    exportBtn.disabled = true;
+    exportMenu.classList.remove('open');
+    setFavoritesUiState(false);
+    return;
+  }
   exportBtn.disabled = false;
 
   const headers = ['demo_name', 'map', 'player_name', 'highlight', 'info'];
@@ -352,12 +447,15 @@ function renderTable() {
   html += '<th class="fav-th"></th>';   // favorite column header
   html += '</tr></thead><tbody>';
 
-  for (const id of orderedIds) {
+  for (const id of shown) {
     const meta = rowMeta.get(id);
     const r = meta.row;
     html += `<tr data-row-id="${id}">`;
     headers.forEach((h, i) => {
-      const v = r[i] === null || r[i] === undefined ? '' : String(r[i]);
+      // The highlight column swaps between clocks; every other column is
+      // read straight out of the row.
+      const raw = (i === COL_HIGHLIGHT_SERVER) ? highlightText(r) : r[i];
+      const v = raw === null || raw === undefined ? '' : String(raw);
       html += `<td class="${colClass[h]}">${escapeHtml(v)}</td>`;
     });
     const star = meta.favorite ? '\u2605' : '\u2606';   // ★ vs ☆
@@ -589,10 +687,14 @@ function rowsForExport(format) {
     `.export-row[data-format="${format}"] .fav-toggle input`);
   const favoritesOnly = cb && cb.checked && !cb.disabled;
   const out = [];
-  for (const id of orderedIds) {
+  // Export what's on screen: same filter, same clock. Whatever you narrowed
+  // the table down to is what lands in the file.
+  for (const id of visibleIds()) {
     const meta = rowMeta.get(id);
     if (favoritesOnly && !meta.favorite) continue;
-    out.push(meta.row);
+    const r = meta.row.slice(0, 5);
+    r[COL_HIGHLIGHT_SERVER] = highlightText(meta.row);
+    out.push(r);
   }
   return out;
 }
@@ -661,6 +763,23 @@ clearBtn.addEventListener('click', () => {
   log.style.display = 'none';
   status.textContent = 'Waiting for demos\u2026';
   renderTable();
+});
+
+// === Filter panel wiring ===
+
+document.querySelectorAll('#typeFilters input').forEach(cb => {
+  cb.addEventListener('change', () => {
+    if (cb.checked) activeTypes.add(cb.dataset.type);
+    else activeTypes.delete(cb.dataset.type);
+    renderTable();
+  });
+});
+
+document.querySelectorAll('#timeFilters input').forEach(rb => {
+  rb.addEventListener('change', () => {
+    if (rb.checked) timeBase = rb.value;
+    renderTable();
+  });
 });
 
 renderTable();

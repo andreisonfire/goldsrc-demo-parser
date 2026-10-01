@@ -1,4 +1,4 @@
-GoldSrc Demo Parser (GSDP) v2.0
+GoldSrc Demo Parser (GSDP) v2.1
 By THUNDERGOD
 ================================================================
 
@@ -16,6 +16,17 @@ Counter-Strike 1.6. Работает локально, Python ставить н�
 6. Нажми "Export" → выбирай CSV или TXT
    Галочка "favourites only" выгрузит только отмеченные ⭐
 7. После сохранения откроется проводник с выделенным файлом
+
+Что нового в v2.1: над таблицей появилась панель фильтров.
+Можно оставить только нужные типы хайлайтов (ace, 4k, triple,
+double, fast 3hs) и переключить время между серверным и demo —
+последнее совпадает с тем, что показывает плеер демок. Экспорт
+выгружает то, что видно, с выбранным временем.
+
+Также парсер точнее определяет структуру матча —
+раньше в редких случаях за начало стороны принимался вялый
+разминочный раунд или эко-раунд посреди половины, и тогда
+хайлайты собирались не с той части демки.
 
 Что нового в v2.0: приложение теперь запускается как настоящая
 десктоп-программа, а не через браузер. Никакого localhost:8765
@@ -111,7 +122,7 @@ https://github.com/andreisonfire/goldsrc-demo-parser/issues
                         ENGLISH
 ================================================================
 
-GoldSrc Demo Parser (GSDP) v2.0
+GoldSrc Demo Parser (GSDP) v2.1
 By THUNDERGOD
 
 A tool for pulling highlights (multikills) out of Counter-Strike 1.6
@@ -128,6 +139,21 @@ HOW TO USE
 6. Hit "Export" and pick CSV or TXT
    The "favourites only" tick exports just the starred rows
 7. Once saved, your file manager opens with the file selected
+
+
+WHAT'S NEW IN v2.1
+------------------
+A filter panel sits above the results table. Narrow it to just the highlight
+types you care about (ace, 4k, triple, double, fast 3hs), and switch the
+timestamps between server time and demo time — the latter matches what a demo
+player shows. Export follows the panel: you get what you see, on the clock you
+picked.
+
+
+The parser also pins down the match structure more precisely. In rare cases a
+listless warm-up round, or an eco round in the middle of a half, was taken
+for the start of a side — and highlights were then collected from the wrong
+part of the demo.
 
 
 WHAT'S NEW IN v2.0

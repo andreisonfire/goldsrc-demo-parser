@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM  Build cs16_killfeed.exe + gsdp.exe (standalone) for v2.0.
+REM  Build cs16_killfeed.exe + gsdp.exe (standalone) for v2.1.
 REM
 REM  gsdp.exe is a desktop app powered by pywebview — no
 REM  browser needed. Uses the system's WebView2 runtime, which
@@ -41,7 +41,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo === Step 2/5: installing pywebview (v2.0 UI runtime) ===
+echo === Step 2/5: installing pywebview (v2.1 UI runtime) ===
 %PY% -m pip install --user --upgrade pywebview
 if errorlevel 1 (
     echo [ERROR] Failed to install pywebview.
@@ -69,7 +69,7 @@ if errorlevel 1 (
 echo.
 echo === Step 4/5: building gsdp.exe (desktop app) ===
 REM --- --windowed: no console popup on launch (this is the whole
-REM     point of v2.0 — the app should look like a real app).
+REM     point of v2.1 — the app should look like a real app).
 REM --- --collect-all webview: pywebview installs as PyPI package
 REM     `pywebview` but imports as `webview` — module name, not package
 REM     name, is what PyInstaller wants. This pulls in WebView2Loader.dll

@@ -545,7 +545,8 @@ def infer_teams_from_kills(kills, slot_names):
     # Entities seen actually fighting. The HLTV proxy occupies a slot but
     # never kills or dies, so it would be unconstrained noise in the split.
     active = set()
-    for _t, killer, victim, _hs, _w in kills:
+    for kill in kills:
+        killer, victim = kill[1], kill[2]
         if killer and killer != victim:
             active.add(killer)
             active.add(victim)
@@ -555,7 +556,8 @@ def infer_teams_from_kills(kills, slot_names):
         return None
 
     weight = defaultdict(int)
-    for _t, killer, victim, _hs, _w in kills:
+    for kill in kills:
+        killer, victim = kill[1], kill[2]
         if killer == 0 or killer == victim:
             continue
         if killer not in active or victim not in active:
@@ -596,7 +598,7 @@ def is_teammate_kill(kill, model_history, teams=None):
     and equal. If either is unknown we return False rather than drop a kill
     that might be legitimate.
     """
-    ftime, killer_ent, victim_ent, _hs, _w = kill
+    ftime, killer_ent, victim_ent = kill[0], kill[1], kill[2]
     if killer_ent == 0 or killer_ent == victim_ent:
         return False
 
@@ -882,6 +884,7 @@ def find_round_boundaries(netmsgs):
 PISTOL_ROUND_WEAPONS = {"glock18", "usp", "p228", "deagle", "elite",
                         "fiveseven", "knife", "grenade", "hegrenade"}
 PISTOL_ROUND_FRAC = 0.75    # share of a round's kills that must be pistol-class
+PISTOL_ROUND_MIN_KILLS = 6  # a real pistol round is a full ten-man fight
 REGULATION_HALF = 15        # a CS 1.6 first half is always exactly this
 MATCH_WIN_ROUNDS = 16       # first team to this many rounds wins regulation
 OVERTIME_HALF = 3           # rounds in an overtime half (the first one always)
@@ -894,9 +897,15 @@ def _pistol_round_flags(kills, rounds, all_boundaries):
 
     Players start a half on $800, so the opening round is pistols, knife and
     grenades only. Overtime halves start on $10000 and so never look like this.
-    Rounds with very few kills are excluded — an eco round mid-half can look
-    pistol-ish, and we only care about the opening round of a half, which is
-    always a full fight.
+
+    The kill-count floor matters as much as the weapon share. A real pistol
+    round is a full ten-man fight and produces seven to nine frags; warm-up
+    rounds are listless, and one with four frags of which three happen to be
+    pistols clears a share test by accident. On
+    McPoker_eml_vs_Competo_KODE5DE the teams couldn't start for an hour, and
+    two such four-frag warm-up rounds were taken for half starts — the real
+    match begins at round 94 with nine pistol frags. Raising the floor to six
+    drops both without touching any genuine half across the corpus.
 
     A round's kill window starts at the previous boundary of ANY kind, restarts
     included, not merely at the previous round win. Rounds cut short by an
@@ -918,7 +927,7 @@ def _pistol_round_flags(kills, rounds, all_boundaries):
                 break
         own = [k for k in kills
                if prev < k[0] <= t and k[1] and k[1] != k[2]]
-        if len(own) < 4:
+        if len(own) < PISTOL_ROUND_MIN_KILLS:
             flags.append(False)
         else:
             pistol = sum(1 for k in own if k[4] in PISTOL_ROUND_WEAPONS)
@@ -971,6 +980,30 @@ def find_live_intervals(kills, round_events):
     pistols = [i for i, f in enumerate(flags) if f]
     if len(pistols) < 2:
         return None        # can't place both halves
+
+    # Drop candidates with no restart burst shortly before them. Every half
+    # opens with mp_restartround, while an eco round mid-half does not — and an
+    # eco round can easily read as pistol-heavy. On
+    # 2008-08-25_18h33_Emulate_dignitas an eco round 8 rounds into the first
+    # half scored 83% pistol, and because it sat within a half of the real
+    # opening pistol round, the rule below mistook the REAL first half for a
+    # false start: the live window jumped forward, a genuine 4k in round 10 was
+    # dropped and a warm-up awp streak let in instead.
+    #
+    # Only applied when it still leaves two candidates, because restart
+    # detection isn't guaranteed — on mtw-vs-no-dsrack3-playoffs the half-time
+    # restart never reaches the stream at all, and demanding one there would
+    # blind us to the second half completely.
+    restarts = sorted(e[0] for e in round_events if e[1] == "restart")
+
+    def _restart_before(idx):
+        lo = rounds[idx - 1][0] if idx > 0 else 0.0
+        hi = rounds[idx][0]
+        return any(lo - RESTART_BURST_GAP <= r <= hi for r in restarts)
+
+    anchored = [i for i in pistols if _restart_before(i)]
+    if len(anchored) >= 2:
+        pistols = anchored
 
     # A pistol round opens a real half only if the next one is at least a full
     # half away. Anything closer is a false start that got replayed.
@@ -1157,7 +1190,7 @@ def select_round_multikills(kills, min_count, round_boundaries=None, max_gap_sec
         round_boundaries = sorted(round_boundaries)
         buckets = defaultdict(list)  # (round_idx, killer) -> [kills]
         for k in kills:
-            ftime, killer, _v, _hs, _w = k
+            ftime, killer = k[0], k[1]
             if killer == 0:
                 continue
             # See ROUND_EDGE_EPS: a frag landing just after the round_end
@@ -1176,7 +1209,7 @@ def select_round_multikills(kills, min_count, round_boundaries=None, max_gap_sec
     # --- Fallback: no boundaries detected ---
     events = defaultdict(list)
     for k in kills:
-        ftime, killer, victim, _hs, _w = k
+        ftime, killer, victim = k[0], k[1], k[2]
         if killer != 0:
             events[killer].append((ftime, "kill", k))
         events[victim].append((ftime, "died", None))
@@ -1452,7 +1485,7 @@ def select_highlights(kills, round_boundaries):
 
     buckets = defaultdict(list)
     for k in kills:
-        ftime, killer, victim, _hs, _w = k
+        ftime, killer, victim = k[0], k[1], k[2]
         if killer == 0:                   # world damage with no attacker
             continue
         if killer == victim:              # self-kill (falldamage, own nade, etc)
@@ -1490,6 +1523,7 @@ def _classify_bucket(klst, n):
             'category': category,
             'weapon': None,             # multiple weapons possible
             'annotations': annotations,
+            'subsets': subsets,         # machine-readable, for the UI filter
         }
 
     if n == 3:
@@ -1633,7 +1667,10 @@ def parse_demo_full(demo_path):
     kills = apply_server_time_to_events(
         kills, svc_samples,
         get_ftime=lambda k: k[0],
-        set_ftime=lambda k, t: (t, k[1], k[2], k[3], k[4]),
+        # The sixth element keeps the ORIGINAL frame time so the UI can show
+        # demo-relative timestamps (what a demo player displays) without
+        # estimating the server offset, which is unreliable on noisy demos.
+        set_ftime=lambda k, t: (t, k[1], k[2], k[3], k[4], k[0]),
     )
     boundaries = apply_server_time_to_events(
         boundaries, svc_samples,
@@ -1846,7 +1883,8 @@ def build_info_string(highlight):
     if cat == 'fast_3hs':
         # 3 HS combo — list the weapons used in this combo
         seen = []
-        for _t, _k, _v, _hs, w in kills:
+        for kill in kills:
+            w = kill[4]
             disp = _weapon_display(w)
             if disp not in seen:
                 seen.append(disp)
@@ -1854,7 +1892,8 @@ def build_info_string(highlight):
 
     # Quad / ace: list all weapons, then any annotations in parens
     seen = []
-    for _t, _k, _v, _hs, w in kills:
+    for kill in kills:
+        w = kill[4]
         disp = _weapon_display(w)
         if disp not in seen:
             seen.append(disp)
@@ -1864,9 +1903,36 @@ def build_info_string(highlight):
     return info
 
 
+def highlight_types(streak):
+    """Every highlight category a streak contains — its own, plus any notable
+    subset inside it.
+
+    An ace that happens to hold a one-shot triple is both an 'ace' and a
+    'triple', so ticking "triple" in the UI filter should surface it. The
+    subsets are already worked out by _scan_subsets() for the annotation text;
+    this just exposes them in machine-readable form instead of only as prose.
+    """
+    types = {streak['category']}
+    for kill_subset in (streak.get('subsets') or {}):
+        if kill_subset == 'triple_one_shot':
+            types.add('triple')
+        elif kill_subset == 'doubles_one_shot':
+            types.add('double')
+        elif kill_subset == 'fast_3hs':
+            types.add('fast_3hs')
+    return types
+
+
 def build_csv_rows(parsed):
     """Build CSV rows from a parsed demo dict.
-    Returns list of [demo_name, map, player_name, highlight, info].
+    Returns list of
+    [demo_name, map, player_name, highlight, info, highlight_demo_time, types].
+
+    `highlight_demo_time` is the same kill lines timed from the start of the
+    recording rather than by the server clock, so the UI can switch between
+    the two without re-parsing. `types` lists every category the streak
+    contains — its own plus any notable subset, so an ace holding a one-shot
+    triple carries both — which is what the category filter matches on.
 
     Names are looked up AT THE TIME OF EACH KILL using name_history. This
     handles the common esports case where a player renames after the match
@@ -1901,13 +1967,20 @@ def build_csv_rows(parsed):
         )
 
         highlight_lines = []
-        for ftime, _k, v_idx, hs, weapon in kills:
+        demo_lines = []
+        for kill in kills:
+            ftime, v_idx, hs, weapon = kill[0], kill[2], kill[3], kill[4]
+            # Demos parsed before this field existed fall back to server time.
+            demo_time = kill[5] if len(kill) > 5 else ftime
             # Victim name: at the time of THIS kill specifically
             victim = name_at_time(
                 name_history, v_idx - 1, ftime,
                 fallback=slot_names.get(v_idx - 1, f"player_{v_idx}"),
             )
-            highlight_lines.append(format_kill(ftime, killer_name, victim, hs, weapon))
+            highlight_lines.append(
+                format_kill(ftime, killer_name, victim, hs, weapon))
+            demo_lines.append(
+                format_kill(demo_time, killer_name, victim, hs, weapon))
 
         rows.append([
             parsed["demo_name"],
@@ -1915,6 +1988,8 @@ def build_csv_rows(parsed):
             killer_name,
             "\n".join(highlight_lines),
             build_info_string(streak),
+            "\n".join(demo_lines),
+            sorted(highlight_types(streak)),
         ])
     return rows
 
