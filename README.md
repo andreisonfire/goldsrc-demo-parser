@@ -4,7 +4,7 @@ Extract multikill highlights from Counter-Strike 1.6 demo files (`.dem`).
 Runs entirely on your computer — no Python installation, no internet required,
 no data ever leaves your machine.
 
-**Made by THUNDERGOD** · [v2.0](#version-history)
+**Made by THUNDERGOD** · [v2.1](#version-history)
 
 ---
 
